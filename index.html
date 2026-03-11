@@ -1,0 +1,1563 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Life Tracker</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.23.10/babel.min.js"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: system-ui, -apple-system, sans-serif; }
+input[type=number]::-webkit-inner-spin-button,
+input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; }
+input[type=color] { cursor: pointer; }
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div id="root"><div style="min-height:100vh;background:#1a1a1a;display:flex;align-items:center;justify-content:center;"><p style="color:#8e8ea0;font-family:system-ui;font-size:14px;">Loading...</p></div></div>
+<script>
+// Make globals available before Babel script runs
+window.addEventListener('DOMContentLoaded', function() {
+  if (!window.React) { document.getElementById('root').innerHTML = '<p style="color:red;padding:2rem">React failed to load. Check your internet connection.</p>'; }
+  if (!window.Recharts) { document.getElementById('root').innerHTML = '<p style="color:red;padding:2rem">Recharts failed to load. Check your internet connection.</p>'; }
+});
+</script>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback, createContext, useContext, useMemo } = React;
+const {
+  AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+  PieChart, Pie, Cell, ReferenceLine, LineChart, Line, BarChart, Bar, Legend
+} = Recharts;
+
+// ── Supabase config (raw REST + Auth — no SDK needed) ─────────────────────────
+const SB_URL = "https://mxhfpnbtccllhjoicljr.supabase.co";
+const SB_KEY = "sb_publishable_EltavzuRf9p1iVGjkDv_Gw_BW9dM7JP";
+
+function sbHeaders(token) {
+  const h = { "Content-Type": "application/json", "apikey": SB_KEY, "Authorization": `Bearer ${token || SB_KEY}` };
+  return h;
+}
+
+// ── Auth helpers ──────────────────────────────────────────────────────────────
+async function sbSignUp(email, password) {
+  const r = await fetch(`${SB_URL}/auth/v1/signup`, {
+    method: "POST", headers: sbHeaders(), body: JSON.stringify({ email, password })
+  });
+  return r.json();
+}
+async function sbSignIn(email, password) {
+  const r = await fetch(`${SB_URL}/auth/v1/token?grant_type=password`, {
+    method: "POST", headers: sbHeaders(), body: JSON.stringify({ email, password })
+  });
+  return r.json();
+}
+async function sbSignOut(token) {
+  await fetch(`${SB_URL}/auth/v1/logout`, { method: "POST", headers: sbHeaders(token) });
+}
+async function sbGetSession() {
+  // Try to restore session from localStorage
+  try {
+    const raw = localStorage.getItem("sb_session");
+    if (!raw) return null;
+    const session = JSON.parse(raw);
+    if (!session?.access_token || !session?.user) return null;
+    // Check if token is still valid (expires_at is unix seconds)
+    if (session.expires_at && Date.now() / 1000 > session.expires_at - 60) {
+      // Try refresh
+      const r = await fetch(`${SB_URL}/auth/v1/token?grant_type=refresh_token`, {
+        method: "POST", headers: sbHeaders(), body: JSON.stringify({ refresh_token: session.refresh_token })
+      });
+      const refreshed = await r.json();
+      if (refreshed.access_token) {
+        localStorage.setItem("sb_session", JSON.stringify(refreshed));
+        return refreshed;
+      }
+      localStorage.removeItem("sb_session");
+      return null;
+    }
+    return session;
+  } catch { return null; }
+}
+
+// ── Data helpers ──────────────────────────────────────────────────────────────
+async function loadFromCloud(userId, token) {
+  try {
+    const r = await fetch(
+      `${SB_URL}/rest/v1/life_tracker_data?user_id=eq.${userId}&select=budget,networth,health`,
+      { headers: { ...sbHeaders(token), "Accept": "application/json" } }
+    );
+    const rows = await r.json();
+    if (!Array.isArray(rows) || rows.length === 0) return null;
+    return rows[0];
+  } catch { return null; }
+}
+async function saveToCloud(userId, token, budget, nw, health) {
+  try {
+    const r = await fetch(`${SB_URL}/rest/v1/life_tracker_data`, {
+      method: "POST",
+      headers: { ...sbHeaders(token), "Prefer": "resolution=merge-duplicates" },
+      body: JSON.stringify({ user_id: userId, budget, networth: nw, health, updated_at: new Date().toISOString() })
+    });
+    return r.ok || r.status === 201 || r.status === 200;
+  } catch { return false; }
+}
+
+const DARK = {
+  bg: "#1a1a1a", surface: "#222222", card: "#2a2a2a", border: "#383838",
+  text: "#ececec", sub: "#8e8ea0", muted: "#555", dim: "#303030", inputBg: "#333333",
+  gold: "#d4a847", blue: "#6b9cf7", green: "#4aba8a", red: "#e0614a", purple: "#9b72e8", teal:"#4ab8c4", isDark: true,
+};
+const LIGHT = {
+  bg: "#f9f9f9", surface: "#ffffff", card: "#ffffff", border: "#e5e5e5",
+  text: "#1a1a1a", sub: "#6b7280", muted: "#aaa", dim: "#f3f3f3", inputBg: "#f5f5f5",
+  gold: "#b8860b", blue: "#2563eb", green: "#059669", red: "#dc2626", purple: "#7c3aed", teal:"#0d9488", isDark: false,
+};
+
+const ThemeCtx = createContext(DARK);
+const useTheme = () => useContext(ThemeCtx);
+
+// ── Finance defaults ──────────────────────────────────────────────────────────
+const DEFAULT_BUDGET = {
+  grossIncome: 7875, taxes: 1738,
+  categories: [
+    { id: "savings", name: "Savings", color: "#6b9cf7", items: [
+      { id: "s1", name: "Roth 401k", amount: 1181, period: "both" },
+      { id: "s2", name: "CMA Edge", amount: 1500, period: "both" },
+      { id: "s3", name: "Discover Savings", amount: 400, period: "both" },
+      { id: "s4", name: "Guardian Capital", amount: 25, period: "1st" },
+    ]},
+    { id: "giving", name: "Giving", color: "#d4a847", items: [
+      { id: "g1", name: "Church", amount: 220, period: "15th" },
+      { id: "g2", name: "Jake Forey", amount: 150, period: "both" },
+      { id: "g3", name: "Bama Catholic", amount: 50, period: "15th" },
+      { id: "g4", name: "Jacob Hatfield", amount: 50, period: "1st" },
+      { id: "g5", name: "Joe Offeron", amount: 50, period: "1st" },
+      { id: "g6", name: "Baby Steps", amount: 27, period: "15th" },
+      { id: "g7", name: "Max Westjohn", amount: 10, period: "15th" },
+      { id: "g8", name: "Other", amount: 70, period: "15th" },
+    ]},
+    { id: "personal", name: "Personal", color: "#9b72e8", items: [
+      { id: "p1", name: "Food", amount: 280, period: "both" },
+      { id: "p2", name: "Fun", amount: 300, period: "both" },
+      { id: "p3", name: "Eating Out", amount: 120, period: "both" },
+      { id: "p4", name: "Parking", amount: 60, period: "both" },
+      { id: "p5", name: "Gas", amount: 40, period: "both" },
+      { id: "p6", name: "Peacock", amount: 19, period: "1st" },
+      { id: "p7", name: "PlayStation+", amount: 10, period: "15th" },
+      { id: "p8", name: "Google One", amount: 2, period: "15th" },
+      { id: "p9", name: "Chat GPT", amount: 0, period: "1st" },
+    ]},
+    { id: "living", name: "Living", color: "#4aba8a", items: [
+      { id: "l1", name: "Rent", amount: 750, period: "1st" },
+      { id: "l2", name: "Gas Bill", amount: 30, period: "15th" },
+      { id: "l3", name: "Electricity", amount: 21, period: "15th" },
+      { id: "l4", name: "Water", amount: 16, period: "15th" },
+    ]},
+    { id: "debt", name: "Debt Payments", color: "#e0614a", items: [
+      { id: "d1", name: "Unsubsidized Loan", amount: 255, period: "1st" },
+      { id: "d2", name: "Grad Plus Loan", amount: 203, period: "1st" },
+    ]},
+  ]
+};
+
+const DEFAULT_NETWORTH = {
+  assets: [
+    { id: "a1", name: "CMA-Edge (Merrill)", amount: 21673.81, type: "investment" },
+    { id: "a2", name: "Grant Thornton 401k", amount: 15494.07, type: "retirement" },
+    { id: "a3", name: "Roth IRA-Edge", amount: 8081.85, type: "retirement" },
+    { id: "a4", name: "Discover Savings", amount: 3948.68, type: "savings" },
+    { id: "a5", name: "Bank of America", amount: 1826.02, type: "cash" },
+    { id: "a6", name: "Bitcoin", amount: 130.00, type: "crypto" },
+    { id: "a7", name: "Guardian Capital", amount: 125.00, type: "investment" },
+  ],
+  liabilities: [
+    { id: "lb1", name: "Student Loans (EdFinancial)", amount: 34728.38 },
+    { id: "lb2", name: "BofA Credit Card", amount: 2160.04 },
+  ],
+  creditScore: 751,
+  snapshots: [{ date: "2026-01", netWorth: 14391 }]
+};
+
+const PRESET_EXERCISES = {
+  upper: ["Bench Press","Incline Bench","Overhead Press","Barbell Row","Pull-ups","Chin-ups","Dumbbell Curl","Hammer Curl","Tricep Pushdown","Skull Crushers","Lateral Raise","Push-ups","Dips","Cable Fly"],
+  lower: ["Squat","Front Squat","Leg Press","Romanian Deadlift","Deadlift","Lunges","Weighted Lunges","Leg Curl","Leg Extension","Calf Raise","Hip Thrust","Step-ups"],
+};
+const BODYWEIGHT_EXERCISES = new Set(["Pull-ups","Chin-ups","Push-ups","Dips"]);
+const DEFAULT_HEALTH = {
+  weightLog: [], weightUnit: "lbs", exercises: [], workoutLogs: [], cardioLogs: [],
+};
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+const uid = () => Math.random().toString(36).slice(2, 8);
+const fmt = n => "$" + Number(n).toLocaleString(undefined, { maximumFractionDigits: 0 });
+const fmtDec = n => "$" + Number(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+function sumItems(items) { return items.reduce((s, i) => s + Number(i.amount || 0), 0); }
+const today = () => new Date().toISOString().slice(0, 10);
+const fmtDate = d => { const [y,m,day] = d.split("-"); return `${m}/${day}/${y.slice(2)}`; };
+const addDays = (d, n) => { const dt = new Date(d); dt.setDate(dt.getDate()+n); return dt.toISOString().slice(0,10); };
+const subDays = (d, n) => addDays(d, -n);
+const pace = (miles, mins) => { if (!miles||!mins) return "—"; const p = mins/miles; return `${Math.floor(p)}:${String(Math.round((p%1)*60)).padStart(2,"0")}/mi`; };
+
+const TYPE_COLORS = { investment: "#6b9cf7", retirement: "#9b72e8", savings: "#4aba8a", cash: "#d4a847", crypto: "#f7931a", other: "#888" };
+const TYPE_LABELS = { investment: "Investment", retirement: "Retirement", savings: "Savings", cash: "Cash", crypto: "Crypto", other: "Other" };
+
+function itemAmountForPeriod(item, period) {
+  const p = item.period || "both";
+  if (period === "monthly") return Number(item.amount || 0);
+  if (p === "both") return Number(item.amount || 0) / 2;
+  if (p === period) return Number(item.amount || 0);
+  return 0;
+}
+
+function sumItemsForPeriod(items, period) {
+  return items.reduce((s, i) => s + itemAmountForPeriod(i, period), 0);
+}
+
+const PERIOD_LABELS = { "1st": "1st (Pay 1)", "15th": "15th (Pay 2)", monthly: "Monthly" };
+const PERIOD_SUB = { "1st": "1st paycheck", "15th": "15th paycheck", monthly: "per month" };
+
+// ── localStorage cache helpers ────────────────────────────────────────────────
+function loadLocal(key, def) {
+  try { const r = localStorage.getItem(key); return r ? JSON.parse(r) : def; } catch { return def; }
+}
+function saveLocal(key, val) {
+  try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
+}
+
+// ── Auth Screen ───────────────────────────────────────────────────────────────
+function AuthScreen({ onAuth }) {
+  const C = DARK;
+  const [mode, setMode] = useState("signin");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [success, setSuccess] = useState("");
+
+  const handle = async () => {
+    setError(""); setSuccess(""); setLoading(true);
+    if (mode === "signup") {
+      const data = await sbSignUp(email, password);
+      if (data.error?.message || data.msg) {
+        setError(data.error?.message || data.msg);
+        setLoading(false); return;
+      }
+      // If no session, email confirmation is required
+      if (!data.access_token) {
+        setSuccess("Check your email to confirm your account, then sign in.");
+        setMode("signin"); setLoading(false); return;
+      }
+      localStorage.setItem("sb_session", JSON.stringify(data));
+      onAuth({ id: data.user.id, email: data.user.email }, data.access_token);
+    } else {
+      const data = await sbSignIn(email, password);
+      if (data.error?.message || data.error_description || !data.access_token) {
+        setError(data.error_description || data.error?.message || "Invalid email or password.");
+        setLoading(false); return;
+      }
+      localStorage.setItem("sb_session", JSON.stringify(data));
+      onAuth({ id: data.user.id, email: data.user.email }, data.access_token);
+    }
+    setLoading(false);
+  };
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.bg, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "system-ui", padding: "1rem" }}>
+      <div style={{ width: "100%", maxWidth: 400 }}>
+        <div style={{ textAlign: "center", marginBottom: "2rem" }}>
+          <div style={{ fontSize: "2.5rem", marginBottom: "0.5rem" }}>💼</div>
+          <h1 style={{ margin: 0, fontSize: "1.7rem", fontWeight: 800, color: C.text, letterSpacing: "-0.03em" }}>Life <span style={{ color: C.gold }}>Tracker</span></h1>
+          <p style={{ margin: "0.4rem 0 0", fontSize: "0.8rem", color: C.sub }}>Your budget, net worth & health — everywhere</p>
+        </div>
+        <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 16, padding: "1.75rem", boxShadow: "0 20px 60px rgba(0,0,0,0.4)" }}>
+          <div style={{ display: "flex", background: C.dim, borderRadius: 9, padding: 3, gap: 3, marginBottom: "1.25rem" }}>
+            {["signin", "signup"].map(m => (
+              <button key={m} onClick={() => { setMode(m); setError(""); setSuccess(""); }}
+                style={{ flex: 1, background: mode === m ? C.surface : "transparent", color: mode === m ? C.text : C.sub, border: mode === m ? `1px solid ${C.border}` : "1px solid transparent", borderRadius: 7, padding: "7px", fontFamily: "system-ui", fontSize: "0.78rem", fontWeight: 700, cursor: "pointer" }}>
+                {m === "signin" ? "Sign In" : "Create Account"}
+              </button>
+            ))}
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+            <div>
+              <p style={{ margin: "0 0 0.3rem", fontSize: "0.65rem", color: C.sub, letterSpacing: "0.1em", textTransform: "uppercase", fontWeight: 600 }}>Email</p>
+              <input type="email" value={email} onChange={e => setEmail(e.target.value)} onKeyDown={e => e.key === "Enter" && handle()} placeholder="you@example.com"
+                style={{ width: "100%", boxSizing: "border-box", background: C.inputBg, border: `1px solid ${C.border}`, borderRadius: 8, color: C.text, fontFamily: "system-ui", fontSize: "0.85rem", padding: "10px 12px", outline: "none" }} />
+            </div>
+            <div>
+              <p style={{ margin: "0 0 0.3rem", fontSize: "0.65rem", color: C.sub, letterSpacing: "0.1em", textTransform: "uppercase", fontWeight: 600 }}>Password</p>
+              <input type="password" value={password} onChange={e => setPassword(e.target.value)} onKeyDown={e => e.key === "Enter" && handle()} placeholder="••••••••"
+                style={{ width: "100%", boxSizing: "border-box", background: C.inputBg, border: `1px solid ${C.border}`, borderRadius: 8, color: C.text, fontFamily: "system-ui", fontSize: "0.85rem", padding: "10px 12px", outline: "none" }} />
+            </div>
+            {error && <p style={{ margin: 0, fontSize: "0.75rem", color: "#e0614a", background: "#e0614a18", borderRadius: 7, padding: "8px 12px" }}>{error}</p>}
+            {success && <p style={{ margin: 0, fontSize: "0.75rem", color: "#4aba8a", background: "#4aba8a18", borderRadius: 7, padding: "8px 12px" }}>{success}</p>}
+            <button onClick={handle} disabled={loading || !email || !password}
+              style={{ background: "#d4a847", color: "#1a1a1a", border: "none", borderRadius: 9, padding: "11px", fontFamily: "system-ui", fontSize: "0.85rem", fontWeight: 800, cursor: loading || !email || !password ? "not-allowed" : "pointer", opacity: loading || !email || !password ? 0.6 : 1, marginTop: "0.25rem" }}>
+              {loading ? "Please wait..." : mode === "signin" ? "Sign In →" : "Create Account →"}
+            </button>
+          </div>
+        </div>
+        <p style={{ textAlign: "center", marginTop: "1rem", fontSize: "0.68rem", color: "#555" }}>Your data is private and tied to your account.</p>
+      </div>
+    </div>
+  );
+}
+
+function useIsMobile() {
+  const [mobile, setMobile] = useState(window.innerWidth < 640);
+  useEffect(() => {
+    const h = () => setMobile(window.innerWidth < 640);
+    window.addEventListener("resize", h); return () => window.removeEventListener("resize", h);
+  }, []);
+  return mobile;
+}
+
+function hexToHsl(hex) {
+  let r=parseInt(hex.slice(1,3),16)/255,g=parseInt(hex.slice(3,5),16)/255,b=parseInt(hex.slice(5,7),16)/255;
+  const max=Math.max(r,g,b),min=Math.min(r,g,b),l=(max+min)/2;
+  if(max===min)return[0,0,l*100];
+  const d=max-min,s=l>0.5?d/(2-max-min):d/(max+min);
+  const h=max===r?((g-b)/d+(g<b?6:0))/6:max===g?((b-r)/d+2)/6:((r-g)/d+4)/6;
+  return[h*360,s*100,l*100];
+}
+function generatePalette(baseHex,count){
+  if(count<=1)return[baseHex];
+  const[h,s,l]=hexToHsl(baseHex);
+  return Array.from({length:count},(_,i)=>{
+    const newH=(h+(i*(360/count)))%360,newL=Math.max(35,Math.min(70,l-10+(i%2)*15));
+    return`hsl(${newH.toFixed(0)},${Math.max(45,s).toFixed(0)}%,${newL.toFixed(0)}%)`;
+  });
+}
+
+// ── Shared UI ─────────────────────────────────────────────────────────────────
+function Label({ children }) {
+  const C = useTheme();
+  return <p style={{margin:"0 0 0.3rem",fontSize:"0.65rem",fontFamily:"system-ui",color:C.sub,letterSpacing:"0.1em",textTransform:"uppercase",fontWeight:600}}>{children}</p>;
+}
+function Card({ children, style={} }) {
+  const C = useTheme();
+  return <div style={{background:C.card,borderRadius:12,padding:"1.1rem",border:`1px solid ${C.border}`,boxShadow:C.isDark?"0 1px 3px rgba(0,0,0,0.3)":"0 1px 4px rgba(0,0,0,0.06)",...style}}>{children}</div>;
+}
+function KPI({ label, value, sub, color }) {
+  const C = useTheme();
+  return (
+    <div style={{background:C.card,borderRadius:10,padding:"0.9rem 1rem",borderLeft:`3px solid ${color}`,border:`1px solid ${C.border}`}}>
+      <Label>{label}</Label>
+      <p style={{margin:"0.15rem 0",fontSize:"1.35rem",fontWeight:700,color,fontFamily:"system-ui"}}>{value}</p>
+      {sub&&<p style={{margin:0,fontSize:"0.67rem",fontFamily:"system-ui",color:C.muted}}>{sub}</p>}
+    </div>
+  );
+}
+function Btn({ children, onClick, variant="ghost", small, disabled, style={} }) {
+  const C = useTheme();
+  const styles = {
+    ghost:{background:"transparent",color:C.sub,border:`1px solid ${C.border}`},
+    primary:{background:C.isDark?"#ffffff":"#1a1a1a",color:C.isDark?"#1a1a1a":"#ffffff",border:"none"},
+    danger:{background:"transparent",color:C.red,border:`1px solid ${C.red}55`},
+    accent:{background:C.blue,color:"#fff",border:"none"},
+  };
+  return <button onClick={onClick} disabled={disabled} style={{...styles[variant],borderRadius:7,padding:small?"4px 10px":"7px 14px",fontFamily:"system-ui",fontSize:small?"0.67rem":"0.75rem",fontWeight:600,cursor:disabled?"not-allowed":"pointer",whiteSpace:"nowrap",opacity:disabled?0.5:1,...style}}>{children}</button>;
+}
+function TInput({ value, onChange, type="text", placeholder, style={} }) {
+  const C = useTheme();
+  return <input type={type} value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder} style={{background:C.inputBg,border:`1px solid ${C.border}`,borderRadius:7,color:C.text,fontFamily:"system-ui",fontSize:"0.8rem",padding:"7px 10px",outline:"none",width:"100%",boxSizing:"border-box",...style}}/>;
+}
+function Select({ value, onChange, children, style={} }) {
+  const C = useTheme();
+  return <select value={value} onChange={e=>onChange(e.target.value)} style={{background:C.inputBg,border:`1px solid ${C.border}`,borderRadius:7,color:C.text,fontFamily:"system-ui",fontSize:"0.76rem",padding:"7px 8px",outline:"none",...style}}>{children}</select>;
+}
+function CustomTooltip({ active, payload, label }) {
+  const C = useTheme();
+  if (!active||!payload?.length) return null;
+  return (
+    <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 13px",fontFamily:"system-ui"}}>
+      {label&&<p style={{color:C.sub,fontSize:"0.67rem",margin:"0 0 3px"}}>{label}</p>}
+      {payload.map((p,i)=><p key={i} style={{color:p.color||C.gold,fontSize:"0.8rem",margin:"2px 0",fontWeight:600}}>{p.name}: {p.value}</p>)}
+    </div>
+  );
+}
+
+function PeriodPill({ value, onChange }) {
+  const C = useTheme();
+  const options = ["1st", "15th", "both"];
+  const colors = { "1st": C.blue, "15th": C.purple, "both": C.green };
+  return (
+    <div style={{display:"flex",borderRadius:6,overflow:"hidden",border:`1px solid ${C.border}`,flexShrink:0}}>
+      {options.map(opt => (
+        <button key={opt} onClick={() => onChange(opt)}
+          style={{
+            padding:"3px 7px",
+            fontFamily:"system-ui",fontSize:"0.6rem",fontWeight:700,
+            cursor:"pointer",border:"none",
+            background: value===opt ? colors[opt] : C.isDark?C.dim:"#f0f0f0",
+            color: value===opt ? "#fff" : C.muted,
+            transition:"background 0.15s,color 0.15s",
+            whiteSpace:"nowrap",
+          }}>
+          {opt}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ── Finance components ────────────────────────────────────────────────────────
+function DrilldownModal({ title, color, items, onClose }) {
+  const C = useTheme();
+  const total = items.reduce((s,i)=>s+i.value,0);
+  const palette = generatePalette(color, items.length);
+  const sorted = items.slice().sort((a,b)=>b.value-a.value);
+  useEffect(()=>{const h=e=>{if(e.key==="Escape")onClose();};window.addEventListener("keydown",h);return()=>window.removeEventListener("keydown",h);},[onClose]);
+  return (
+    <div onClick={onClose} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"1rem"}}>
+      <div onClick={e=>e.stopPropagation()} style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:16,padding:"1.4rem",width:"100%",maxWidth:400,boxShadow:"0 20px 60px rgba(0,0,0,0.4)"}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"1rem"}}>
+          <div style={{display:"flex",alignItems:"center",gap:"0.6rem"}}><div style={{width:12,height:12,borderRadius:"50%",background:color}}/><span style={{fontFamily:"system-ui",fontWeight:700,fontSize:"1rem",color:C.text}}>{title}</span></div>
+          <button onClick={onClose} style={{background:"none",border:"none",color:C.sub,cursor:"pointer",fontSize:"1.2rem",lineHeight:1,padding:"0 4px"}}>×</button>
+        </div>
+        <div style={{display:"flex",justifyContent:"center",marginBottom:"1rem"}}>
+          <ResponsiveContainer width={180} height={140}>
+            <PieChart><Pie data={sorted.map(i=>({name:i.name,value:i.value}))} cx="50%" cy="50%" innerRadius={40} outerRadius={65} dataKey="value" paddingAngle={3}>{sorted.map((_,idx)=><Cell key={idx} fill={palette[idx]}/>)}</Pie><Tooltip content={<CustomTooltip/>}/></PieChart>
+          </ResponsiveContainer>
+        </div>
+        <div style={{display:"flex",flexDirection:"column",gap:"0.5rem"}}>
+          {sorted.map((item,idx)=>{const pct=total>0?(item.value/total)*100:0,col=palette[idx];return(
+            <div key={item.name}>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:"0.2rem"}}>
+                <div style={{display:"flex",alignItems:"center",gap:"6px"}}><div style={{width:8,height:8,borderRadius:"50%",background:col,flexShrink:0}}/><span style={{fontFamily:"system-ui",fontSize:"0.78rem",color:C.text}}>{item.name}</span></div>
+                <div style={{display:"flex",gap:"0.6rem",alignItems:"center"}}><span style={{fontFamily:"system-ui",fontSize:"0.7rem",color:C.sub}}>{pct.toFixed(0)}%</span><span style={{fontFamily:"system-ui",fontSize:"0.8rem",fontWeight:700,color:col}}>{fmtDec(item.value)}</span></div>
+              </div>
+              <div style={{height:5,background:C.isDark?C.surface:C.dim,borderRadius:3,overflow:"hidden"}}><div style={{height:"100%",width:`${pct}%`,background:col,borderRadius:3}}/></div>
+            </div>
+          );})}
+        </div>
+        <div style={{marginTop:"1rem",paddingTop:"0.8rem",borderTop:`1px solid ${C.border}`,display:"flex",justifyContent:"space-between"}}>
+          <span style={{fontFamily:"system-ui",fontSize:"0.75rem",color:C.sub}}>Total</span>
+          <span style={{fontFamily:"system-ui",fontSize:"0.9rem",fontWeight:700,color}}>{fmtDec(total)}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DonutModal({ category, period, onClose }) {
+  const C = useTheme();
+  const items = category.items.map(i => ({ ...i, displayAmount: itemAmountForPeriod(i, period) })).filter(i => i.displayAmount > 0);
+  const total = items.reduce((s,i)=>s+i.displayAmount,0);
+  const palette = generatePalette(category.color, items.length);
+  const sorted = items.slice().sort((a,b)=>b.displayAmount-a.displayAmount);
+  useEffect(()=>{const h=e=>{if(e.key==="Escape")onClose();};window.addEventListener("keydown",h);return()=>window.removeEventListener("keydown",h);},[onClose]);
+  return (
+    <div onClick={onClose} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:"1rem"}}>
+      <div onClick={e=>e.stopPropagation()} style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:16,padding:"1.4rem",width:"100%",maxWidth:380,boxShadow:"0 20px 60px rgba(0,0,0,0.4)"}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"1rem"}}>
+          <div style={{display:"flex",alignItems:"center",gap:"0.6rem"}}><div style={{width:12,height:12,borderRadius:"50%",background:category.color}}/><span style={{fontFamily:"system-ui",fontWeight:700,fontSize:"1rem",color:C.text}}>{category.name}</span></div>
+          <button onClick={onClose} style={{background:"none",border:"none",color:C.sub,cursor:"pointer",fontSize:"1.2rem",lineHeight:1,padding:"0 4px"}}>×</button>
+        </div>
+        <div style={{display:"flex",justifyContent:"center",marginBottom:"0.8rem"}}>
+          <ResponsiveContainer width={180} height={140}>
+            <PieChart><Pie data={sorted.map(i=>({name:i.name,value:i.displayAmount}))} cx="50%" cy="50%" innerRadius={40} outerRadius={65} dataKey="value" paddingAngle={3}>{sorted.map((_,idx)=><Cell key={idx} fill={palette[idx]}/>)}</Pie><Tooltip content={<CustomTooltip/>}/></PieChart>
+          </ResponsiveContainer>
+        </div>
+        <div style={{display:"flex",flexDirection:"column",gap:"0.5rem"}}>
+          {sorted.map((item,idx)=>{const pct=total>0?(item.displayAmount/total)*100:0,col=palette[idx];return(
+            <div key={item.id}>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:"0.2rem"}}>
+                <div style={{display:"flex",alignItems:"center",gap:"6px"}}><div style={{width:8,height:8,borderRadius:"50%",background:col,flexShrink:0}}/><span style={{fontFamily:"system-ui",fontSize:"0.78rem",color:C.text}}>{item.name}</span></div>
+                <div style={{display:"flex",gap:"0.6rem",alignItems:"center"}}><span style={{fontFamily:"system-ui",fontSize:"0.7rem",color:C.sub}}>{pct.toFixed(0)}%</span><span style={{fontFamily:"system-ui",fontSize:"0.8rem",fontWeight:700,color:col}}>{fmt(item.displayAmount)}</span></div>
+              </div>
+              <div style={{height:5,background:C.isDark?C.surface:C.dim,borderRadius:3,overflow:"hidden"}}><div style={{height:"100%",width:`${pct}%`,background:col,borderRadius:3}}/></div>
+            </div>
+          );})}
+        </div>
+        <div style={{marginTop:"1rem",paddingTop:"0.8rem",borderTop:`1px solid ${C.border}`,display:"flex",justifyContent:"space-between"}}>
+          <span style={{fontFamily:"system-ui",fontSize:"0.75rem",color:C.sub}}>Total</span>
+          <span style={{fontFamily:"system-ui",fontSize:"0.9rem",fontWeight:700,color:category.color}}>{fmt(total)}/paycheck</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CreditGauge({ score }) {
+  const C = useTheme();
+  const pct=Math.min(Math.max((score-300)/550,0),1);
+  const color=score>=750?C.green:score>=700?C.blue:score>=650?C.gold:C.red;
+  const label=score>=750?"Excellent":score>=700?"Good":score>=650?"Fair":"Poor";
+  const r=48,cx=70,cy=60;
+  const toXY=deg=>({x:cx+r*Math.cos(deg*Math.PI/180),y:cy+r*Math.sin(deg*Math.PI/180)});
+  const arc=(s,e)=>{const sp=toXY(s),ep=toXY(e);return`M ${sp.x} ${sp.y} A ${r} ${r} 0 0 1 ${ep.x} ${ep.y}`;};
+  const segs=[{s:180,e:216,c:C.red},{s:216,e:252,c:C.gold},{s:252,e:306,c:C.blue},{s:306,e:360,c:C.green}];
+  const needle=toXY(180+pct*180);
+  return (
+    <svg width={140} height={85} viewBox="0 0 140 85">
+      {segs.map((sg,i)=><path key={i} d={arc(sg.s,sg.e)} fill="none" stroke={sg.c} strokeWidth={8} strokeLinecap="round" opacity={0.3}/>)}
+      <path d={arc(180,180+pct*180)} fill="none" stroke={color} strokeWidth={8} strokeLinecap="round"/>
+      <line x1={cx} y1={cy} x2={needle.x} y2={needle.y} stroke={color} strokeWidth={2.5} strokeLinecap="round"/>
+      <circle cx={cx} cy={cy} r={3.5} fill={color}/>
+      <text x={cx} y={cy+18} textAnchor="middle" fill={color} fontFamily="system-ui" fontSize="16" fontWeight="800">{score}</text>
+      <text x={cx} y={cy+31} textAnchor="middle" fill={C.sub} fontFamily="system-ui" fontSize="8">{label}</text>
+    </svg>
+  );
+}
+
+function NetWorthVisuals({ nw }) {
+  const C=useTheme(),isMobile=useIsMobile();
+  const [drilldown,setDrilldown]=useState(null);
+  const totalAssets=nw.assets.reduce((s,a)=>s+Number(a.amount||0),0);
+  const totalLiabs=nw.liabilities.reduce((s,l)=>s+Number(l.amount||0),0);
+  const netWorth=totalAssets-totalLiabs;
+  const snapshots=(nw.snapshots||[]).slice().sort((a,b)=>a.date.localeCompare(b.date));
+  const byType={};nw.assets.forEach(a=>{const t=a.type||"other";if(!byType[t])byType[t]=[];byType[t].push(a);});
+  const typeData=Object.entries(byType).map(([type,assets])=>({name:TYPE_LABELS[type]||type,value:assets.reduce((s,a)=>s+Number(a.amount||0),0),color:TYPE_COLORS[type]||"#888",type,items:assets.map(a=>({name:a.name,value:Number(a.amount||0),type:TYPE_LABELS[a.type]||a.type}))}));
+  const debtData=nw.liabilities.map((l,i)=>({name:l.name,value:Number(l.amount),color:i===0?C.red:"#e8a05b"}));
+  const monthlySavings=3106;
+  const projData=[{label:"Now",value:Math.round(netWorth)},{label:"1Y",value:Math.round(netWorth+monthlySavings*12)},{label:"3Y",value:Math.round(netWorth+monthlySavings*36)},{label:"5Y",value:Math.round(netWorth+monthlySavings*60)},{label:"10Y",value:Math.round(netWorth+monthlySavings*120)},{label:"20Y",value:Math.round(netWorth+monthlySavings*240)}];
+  const debtPayoffPct=Math.min((totalAssets/(totalAssets+totalLiabs))*100,100);
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:"1rem"}}>
+      {drilldown&&<DrilldownModal {...drilldown} onClose={()=>setDrilldown(null)}/>}
+      <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":"1fr 1fr 200px",gap:"1rem"}}>
+        <Card>
+          <Label>Asset Allocation — tap to drill down</Label>
+          <ResponsiveContainer width="100%" height={185}><PieChart><Pie data={typeData} cx="50%" cy="50%" innerRadius={48} outerRadius={78} dataKey="value" paddingAngle={3} onClick={d=>{const f=typeData.find(t=>t.name===d.name);if(f)setDrilldown({title:`${f.name} Assets`,color:f.color,items:f.items});}} style={{cursor:"pointer"}}>{typeData.map((e,i)=><Cell key={i} fill={e.color}/>)}</Pie><Tooltip content={<CustomTooltip/>}/></PieChart></ResponsiveContainer>
+          <div style={{display:"flex",flexWrap:"wrap",gap:"0.4rem",marginTop:"0.3rem"}}>{typeData.map(t=><button key={t.name} onClick={()=>setDrilldown({title:`${t.name} Assets`,color:t.color,items:t.items})} style={{display:"flex",alignItems:"center",gap:"4px",background:"transparent",border:`1px solid ${t.color}44`,borderRadius:20,padding:"2px 7px",cursor:"pointer"}}><div style={{width:7,height:7,borderRadius:"50%",background:t.color}}/><span style={{fontFamily:"system-ui",fontSize:"0.63rem",color:C.sub}}>{t.name} {((t.value/totalAssets)*100).toFixed(0)}%</span></button>)}</div>
+        </Card>
+        <Card>
+          <Label>Debt Breakdown</Label>
+          <ResponsiveContainer width="100%" height={185}><PieChart><Pie data={debtData} cx="50%" cy="50%" innerRadius={48} outerRadius={78} dataKey="value" paddingAngle={3} onClick={()=>setDrilldown({title:"Debt Breakdown",color:C.red,items:nw.liabilities.map(l=>({name:l.name,value:Number(l.amount)}))})} style={{cursor:"pointer"}}>{debtData.map((e,i)=><Cell key={i} fill={e.color}/>)}</Pie><Tooltip content={<CustomTooltip/>}/></PieChart></ResponsiveContainer>
+          <div style={{display:"flex",flexDirection:"column",gap:"0.3rem",marginTop:"0.3rem"}}>{debtData.map(d=><button key={d.name} onClick={()=>setDrilldown({title:"Debt Breakdown",color:C.red,items:nw.liabilities.map(l=>({name:l.name,value:Number(l.amount)}))})} style={{display:"flex",alignItems:"center",gap:"6px",background:"transparent",border:"none",cursor:"pointer",padding:"2px 0"}}><div style={{width:7,height:7,borderRadius:"50%",background:d.color,flexShrink:0}}/><span style={{fontFamily:"system-ui",fontSize:"0.63rem",color:C.sub,flex:1,textAlign:"left"}}>{d.name}</span><span style={{fontFamily:"system-ui",fontSize:"0.65rem",fontWeight:600,color:d.color}}>{fmt(d.value)}</span></button>)}</div>
+        </Card>
+        <Card style={{display:"flex",flexDirection:"column",gap:"0.8rem"}}>
+          <Label>Credit Score</Label>
+          <div style={{display:"flex",justifyContent:"center"}}><CreditGauge score={nw.creditScore}/></div>
+          <div>
+            <Label>Solvency Ratio</Label>
+            <div style={{display:"flex",height:8,borderRadius:4,overflow:"hidden",gap:1,marginTop:"0.3rem"}}><div style={{width:`${debtPayoffPct}%`,background:C.green}}/><div style={{flex:1,background:C.red}}/></div>
+            <div style={{display:"flex",justifyContent:"space-between",marginTop:"0.2rem"}}><span style={{fontFamily:"system-ui",fontSize:"0.6rem",color:C.green}}>Assets {debtPayoffPct.toFixed(0)}%</span><span style={{fontFamily:"system-ui",fontSize:"0.6rem",color:C.red}}>Debt {(100-debtPayoffPct).toFixed(0)}%</span></div>
+          </div>
+          <div style={{padding:"0.6rem 0.8rem",background:C.isDark?C.surface:C.dim,borderRadius:8,textAlign:"center"}}><p style={{margin:0,fontFamily:"system-ui",fontSize:"0.6rem",color:C.sub}}>DEBT-TO-ASSET</p><p style={{margin:"0.15rem 0 0",fontFamily:"system-ui",fontSize:"1.15rem",fontWeight:700,color:C.gold}}>{((totalLiabs/totalAssets)*100).toFixed(0)}%</p></div>
+        </Card>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":"1fr 2fr",gap:"1rem"}}>
+        <Card>
+          <Label>Balance Summary</Label>
+          <div style={{display:"flex",flexDirection:"column",gap:"0.75rem",marginTop:"0.5rem"}}>
+            {[{label:"Total Assets",value:totalAssets,color:C.green,total:totalAssets+totalLiabs},{label:"Total Debt",value:totalLiabs,color:C.red,total:totalAssets+totalLiabs},{label:"Net Worth",value:netWorth,color:C.gold,total:totalAssets}].map(row=>(
+              <div key={row.label}>
+                <div style={{display:"flex",justifyContent:"space-between",marginBottom:"0.2rem"}}><span style={{fontFamily:"system-ui",fontSize:"0.72rem",color:C.sub}}>{row.label}</span><span style={{fontFamily:"system-ui",fontSize:"0.75rem",fontWeight:700,color:row.color}}>{fmt(row.value)}</span></div>
+                <div style={{height:7,background:C.isDark?C.surface:C.dim,borderRadius:4}}><div style={{height:"100%",width:`${Math.min(Math.max((row.value/row.total)*100,0),100)}%`,background:row.color,borderRadius:4,transition:"width 0.5s"}}/></div>
+              </div>
+            ))}
+          </div>
+        </Card>
+        <Card>
+          <Label>Net Worth Projection (at $3,106/mo savings)</Label>
+          <ResponsiveContainer width="100%" height={195}>
+            <AreaChart data={projData} margin={{top:8,right:8,left:4,bottom:0}}>
+              <defs><linearGradient id="projGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={C.gold} stopOpacity={0.25}/><stop offset="95%" stopColor={C.gold} stopOpacity={0}/></linearGradient></defs>
+              <CartesianGrid strokeDasharray="3 3" stroke={C.border}/>
+              <XAxis dataKey="label" tick={{fill:C.sub,fontFamily:"system-ui",fontSize:10}} axisLine={false} tickLine={false}/>
+              <YAxis tick={{fill:C.sub,fontFamily:"system-ui",fontSize:9}} axisLine={false} tickLine={false} tickFormatter={v=>v>=1000000?`$${(v/1000000).toFixed(1)}M`:`$${(v/1000).toFixed(0)}k`}/>
+              <Tooltip content={<CustomTooltip/>}/>
+              <ReferenceLine y={0} stroke={C.red} strokeDasharray="3 3"/>
+              <Area type="monotone" dataKey="value" stroke={C.gold} strokeWidth={2.5} fill="url(#projGrad)" dot={{fill:C.gold,r:3.5,strokeWidth:0}} name="Net Worth"/>
+            </AreaChart>
+          </ResponsiveContainer>
+        </Card>
+      </div>
+      <Card>
+        <Label>Net Worth History</Label>
+        {snapshots.length<2?<div style={{padding:"1.2rem",background:C.isDark?C.surface:C.dim,borderRadius:8,marginTop:"0.5rem"}}><p style={{color:C.muted,fontFamily:"system-ui",fontSize:"0.78rem",margin:0,textAlign:"center"}}>Save monthly snapshots to build your history chart. You have {snapshots.length} so far.</p></div>
+        :<ResponsiveContainer width="100%" height={165}><AreaChart data={snapshots} margin={{top:8,right:8,left:4,bottom:0}}><defs><linearGradient id="histGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={C.green} stopOpacity={0.25}/><stop offset="95%" stopColor={C.green} stopOpacity={0}/></linearGradient></defs><CartesianGrid strokeDasharray="3 3" stroke={C.border}/><XAxis dataKey="date" tick={{fill:C.sub,fontFamily:"system-ui",fontSize:10}} axisLine={false} tickLine={false}/><YAxis tick={{fill:C.sub,fontFamily:"system-ui",fontSize:9}} axisLine={false} tickLine={false} tickFormatter={v=>`$${(v/1000).toFixed(0)}k`}/><Tooltip content={<CustomTooltip/>}/><Area type="monotone" dataKey="netWorth" stroke={C.green} strokeWidth={2.5} fill="url(#histGrad)" dot={{fill:C.green,r:3.5,strokeWidth:0}} name="Net Worth"/></AreaChart></ResponsiveContainer>}
+        {snapshots.length>0&&<div style={{display:"flex",flexWrap:"wrap",gap:"0.5rem",marginTop:"0.8rem"}}>{snapshots.map((s,i)=>{const diff=i>0?s.netWorth-snapshots[i-1].netWorth:null;return(<div key={s.date} style={{background:C.isDark?C.surface:C.dim,border:`1px solid ${C.border}`,borderRadius:8,padding:"0.4rem 0.75rem"}}><p style={{margin:0,fontFamily:"system-ui",fontSize:"0.6rem",color:C.sub}}>{s.date}</p><p style={{margin:"1px 0 0",fontFamily:"system-ui",fontSize:"0.82rem",fontWeight:700,color:C.gold}}>{fmt(s.netWorth)}</p>{diff!==null&&<p style={{margin:0,fontFamily:"system-ui",fontSize:"0.6rem",color:diff>=0?C.green:C.red}}>{diff>=0?"+":""}{fmt(diff)}</p>}</div>);})}</div>}
+      </Card>
+    </div>
+  );
+}
+
+function NetWorthEditor({ nw, setNw }) {
+  const C=useTheme(),isMobile=useIsMobile();
+  const [editingAssets,setEditingAssets]=useState(false);
+  const [editingLiabs,setEditingLiabs]=useState(false);
+  const [newAssetName,setNewAssetName]=useState("");
+  const [newAssetAmt,setNewAssetAmt]=useState("");
+  const [newAssetType,setNewAssetType]=useState("investment");
+  const [newLiabName,setNewLiabName]=useState("");
+  const [newLiabAmt,setNewLiabAmt]=useState("");
+  const [assetColors,setAssetColors]=useState(()=>{const m={};nw.assets.forEach(a=>{m[a.id]=TYPE_COLORS[a.type]||"#888";});return m;});
+  const [liabColors,setLiabColors]=useState(()=>{const m={};nw.liabilities.forEach((l,i)=>{m[l.id]=i===0?"#e0614a":"#e8a05b";});return m;});
+  const [newScore,setNewScore]=useState(nw.creditScore);
+  const [editScore,setEditScore]=useState(false);
+  const getAssetColor=a=>assetColors[a.id]||TYPE_COLORS[a.type]||"#888";
+  const getLiabColor=l=>liabColors[l.id]||"#e0614a";
+  const totalAssets=nw.assets.reduce((s,a)=>s+Number(a.amount||0),0);
+  const totalLiabs=nw.liabilities.reduce((s,l)=>s+Number(l.amount||0),0);
+  const netWorth=totalAssets-totalLiabs;
+  const ua=(id,f,v)=>setNw(n=>({...n,assets:n.assets.map(a=>a.id!==id?a:{...a,[f]:f==="amount"?parseFloat(v)||0:v})}));
+  const ul=(id,f,v)=>setNw(n=>({...n,liabilities:n.liabilities.map(l=>l.id!==id?l:{...l,[f]:f==="amount"?parseFloat(v)||0:v})}));
+  const addAsset=()=>{if(!newAssetName.trim())return;const id=uid();setNw(n=>({...n,assets:[...n.assets,{id,name:newAssetName.trim(),amount:parseFloat(newAssetAmt)||0,type:newAssetType}]}));setAssetColors(m=>({...m,[id]:TYPE_COLORS[newAssetType]||"#888"}));setNewAssetName("");setNewAssetAmt("");};
+  const addLiab=()=>{if(!newLiabName.trim())return;const id=uid();setNw(n=>({...n,liabilities:[...n.liabilities,{id,name:newLiabName.trim(),amount:parseFloat(newLiabAmt)||0}]}));setLiabColors(m=>({...m,[id]:"#e0614a"}));setNewLiabName("");setNewLiabAmt("");};
+  const saveSnapshot=()=>{const now=new Date();const label=`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}`;setNw(n=>{const snaps=[...(n.snapshots||[])];const idx=snaps.findIndex(s=>s.date===label);if(idx>=0)snaps[idx]={date:label,netWorth:Math.round(netWorth)};else snaps.push({date:label,netWorth:Math.round(netWorth)});return{...n,snapshots:snaps};});};
+  const ReadonlyRow=({label,value,color})=>(<div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"0.45rem 0",borderBottom:`1px solid ${C.border}`}}><span style={{fontFamily:"system-ui",fontSize:"0.78rem",color:C.sub,flex:1}}>{label}</span><span style={{fontFamily:"system-ui",fontSize:"0.88rem",fontWeight:700,color}}>{value}</span></div>);
+  const SWATCHES=["#6b9cf7","#9b72e8","#4aba8a","#d4a847","#f7931a","#e0614a","#4ab8c4","#e8a05b","#e87db0","#7dd87d"];
+  return (
+    <div>
+      <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr 1fr":"repeat(4, 1fr)",gap:"0.75rem",marginBottom:"1.2rem"}}>
+        <KPI label="Total Assets" value={fmt(totalAssets)} sub={`${nw.assets.length} accounts`} color={C.green}/>
+        <KPI label="Total Liabilities" value={fmt(totalLiabs)} sub={`${nw.liabilities.length} items`} color={C.red}/>
+        <KPI label="Net Worth" value={fmt(netWorth)} sub="assets − liabilities" color={C.gold}/>
+        <KPI label="Credit Score" value={nw.creditScore} sub="Excellent" color={C.blue}/>
+      </div>
+      <NetWorthVisuals nw={nw}/>
+      <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":"1fr 1fr",gap:"1rem",marginTop:"1.2rem"}}>
+        <Card>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"0.75rem"}}>
+            <Label>Assets — {fmtDec(totalAssets)}</Label>
+            <Btn small onClick={()=>setEditingAssets(e=>!e)}>{editingAssets?"✓ Done":"✏️ Edit"}</Btn>
+          </div>
+          {!editingAssets?<div style={{display:"flex",flexDirection:"column"}}>{nw.assets.map(a=>(<ReadonlyRow key={a.id} label={<span style={{display:"flex",alignItems:"center",gap:"6px"}}><span style={{width:7,height:7,borderRadius:"50%",background:getAssetColor(a),display:"inline-block",flexShrink:0}}/>{a.name}<span style={{fontSize:"0.6rem",color:C.muted,background:C.isDark?C.surface:C.dim,borderRadius:4,padding:"1px 5px"}}>{TYPE_LABELS[a.type]||a.type}</span></span>} value={fmtDec(a.amount)} color={getAssetColor(a)}/>))}</div>
+          :<div style={{display:"flex",flexDirection:"column",gap:"0.6rem",marginBottom:"0.75rem"}}>
+            {nw.assets.map(a=>{const col=getAssetColor(a);return(<div key={a.id} style={{background:C.isDark?C.surface:C.dim,borderRadius:8,padding:"0.5rem 0.6rem"}}>
+              <div style={{display:"flex",alignItems:"center",gap:"0.4rem",marginBottom:"0.4rem"}}><div style={{width:7,height:7,borderRadius:"50%",background:col,flexShrink:0}}/><input value={a.name} onChange={e=>ua(a.id,"name",e.target.value)} style={{flex:1,minWidth:0,background:C.inputBg,border:`1px solid ${C.border}`,borderRadius:6,color:C.text,fontFamily:"system-ui",fontSize:"0.74rem",padding:"4px 7px",outline:"none"}}/><input type="number" value={a.amount} onChange={e=>ua(a.id,"amount",e.target.value)} style={{width:110,background:C.inputBg,border:`1px solid ${C.border}`,borderRadius:7,color:col,fontFamily:"system-ui",fontSize:"0.76rem",padding:"5px 8px",outline:"none",boxSizing:"border-box"}}/><select value={a.type||"other"} onChange={e=>ua(a.id,"type",e.target.value)} style={{background:C.inputBg,border:`1px solid ${C.border}`,borderRadius:6,color:C.sub,fontFamily:"system-ui",fontSize:"0.62rem",padding:"4px 5px",outline:"none"}}>{Object.entries(TYPE_LABELS).map(([k,v])=><option key={k} value={k}>{v}</option>)}</select><button onClick={()=>setNw(n=>({...n,assets:n.assets.filter(x=>x.id!==a.id)}))} style={{background:"none",border:"none",color:C.red,cursor:"pointer",fontSize:"1rem",padding:"0 2px",flexShrink:0}}>×</button></div>
+              <div style={{display:"flex",alignItems:"center",gap:"0.4rem",paddingLeft:"0.2rem"}}><span style={{fontFamily:"system-ui",fontSize:"0.6rem",color:C.muted,whiteSpace:"nowrap"}}>Color:</span>{SWATCHES.map(c=><button key={c} onClick={()=>setAssetColors(m=>({...m,[a.id]:c}))} style={{width:14,height:14,borderRadius:"50%",background:c,border:col===c?`2px solid ${C.text}`:"2px solid transparent",cursor:"pointer",padding:0,flexShrink:0}}/>)}<input type="color" value={col} onChange={e=>setAssetColors(m=>({...m,[a.id]:e.target.value}))} style={{width:14,height:14,borderRadius:"50%",border:`2px solid ${C.border}`,cursor:"pointer",padding:0,background:"none",outline:"none"}}/></div>
+            </div>);})}
+            <div style={{display:"flex",gap:"0.4rem",flexWrap:"wrap",paddingTop:"0.4rem",borderTop:`1px solid ${C.border}`}}><TInput value={newAssetName} onChange={setNewAssetName} placeholder="Account name..."/><TInput type="number" value={newAssetAmt} onChange={setNewAssetAmt} placeholder="Amount" style={{width:100}}/><select value={newAssetType} onChange={e=>setNewAssetType(e.target.value)} style={{background:C.inputBg,border:`1px solid ${C.border}`,borderRadius:7,color:C.sub,fontFamily:"system-ui",fontSize:"0.7rem",padding:"7px 6px",outline:"none"}}>{Object.entries(TYPE_LABELS).map(([k,v])=><option key={k} value={k}>{v}</option>)}</select><Btn small variant="primary" onClick={addAsset}>+ Add</Btn></div>
+          </div>}
+        </Card>
+        <Card>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"0.75rem"}}>
+            <Label>Liabilities — {fmtDec(totalLiabs)}</Label>
+            <Btn small onClick={()=>setEditingLiabs(e=>!e)}>{editingLiabs?"✓ Done":"✏️ Edit"}</Btn>
+          </div>
+          {!editingLiabs?<div style={{display:"flex",flexDirection:"column"}}>{nw.liabilities.map(l=><ReadonlyRow key={l.id} label={<span style={{display:"flex",alignItems:"center",gap:"6px"}}><span style={{width:7,height:7,borderRadius:"50%",background:getLiabColor(l),display:"inline-block",flexShrink:0}}/>{l.name}</span>} value={fmtDec(l.amount)} color={getLiabColor(l)}/>)}</div>
+          :<div style={{display:"flex",flexDirection:"column",gap:"0.6rem",marginBottom:"0.75rem"}}>
+            {nw.liabilities.map(l=>{const col=getLiabColor(l);return(<div key={l.id} style={{background:C.isDark?C.surface:C.dim,borderRadius:8,padding:"0.5rem 0.6rem"}}>
+              <div style={{display:"flex",alignItems:"center",gap:"0.4rem",marginBottom:"0.4rem"}}><div style={{width:7,height:7,borderRadius:"50%",background:col,flexShrink:0}}/><input value={l.name} onChange={e=>ul(l.id,"name",e.target.value)} style={{flex:1,minWidth:0,background:C.inputBg,border:`1px solid ${C.border}`,borderRadius:6,color:C.text,fontFamily:"system-ui",fontSize:"0.74rem",padding:"4px 7px",outline:"none"}}/><input type="number" value={l.amount} onChange={e=>ul(l.id,"amount",e.target.value)} style={{width:110,background:C.inputBg,border:`1px solid ${C.border}`,borderRadius:7,color:col,fontFamily:"system-ui",fontSize:"0.76rem",padding:"5px 8px",outline:"none",boxSizing:"border-box"}}/><button onClick={()=>setNw(n=>({...n,liabilities:n.liabilities.filter(x=>x.id!==l.id)}))} style={{background:"none",border:"none",color:C.red,cursor:"pointer",fontSize:"1rem",padding:"0 2px",flexShrink:0}}>×</button></div>
+              <div style={{display:"flex",alignItems:"center",gap:"0.4rem",paddingLeft:"0.2rem"}}><span style={{fontFamily:"system-ui",fontSize:"0.6rem",color:C.muted,whiteSpace:"nowrap"}}>Color:</span>{["#e0614a","#e8a05b","#6b9cf7","#9b72e8","#4aba8a","#d4a847","#f7931a","#4ab8c4","#e87db0","#7dd87d"].map(c=><button key={c} onClick={()=>setLiabColors(m=>({...m,[l.id]:c}))} style={{width:14,height:14,borderRadius:"50%",background:c,border:col===c?`2px solid ${C.text}`:"2px solid transparent",cursor:"pointer",padding:0,flexShrink:0}}/>)}<input type="color" value={col} onChange={e=>setLiabColors(m=>({...m,[l.id]:e.target.value}))} style={{width:14,height:14,borderRadius:"50%",border:`2px solid ${C.border}`,cursor:"pointer",padding:0,background:"none",outline:"none"}}/></div>
+            </div>);})}
+            <div style={{display:"flex",gap:"0.4rem",paddingTop:"0.4rem",borderTop:`1px solid ${C.border}`}}><TInput value={newLiabName} onChange={setNewLiabName} placeholder="Liability name..."/><TInput type="number" value={newLiabAmt} onChange={setNewLiabAmt} placeholder="Amount" style={{width:110}}/><Btn small variant="primary" onClick={addLiab}>+ Add</Btn></div>
+          </div>}
+          <div style={{paddingTop:"0.9rem",borderTop:`1px solid ${C.border}`,display:"flex",alignItems:"center",gap:"0.7rem",flexWrap:"wrap",marginTop:"0.5rem"}}>
+            <Label>Credit Score</Label>
+            {editScore?<><TInput type="number" value={newScore} onChange={setNewScore} style={{width:85}}/><Btn small variant="primary" onClick={()=>{setNw(n=>({...n,creditScore:parseInt(newScore)||0}));setEditScore(false);}}>Save</Btn></>:<><span style={{fontFamily:"system-ui",fontSize:"0.95rem",color:C.blue,fontWeight:700}}>{nw.creditScore}</span><Btn small onClick={()=>setEditScore(true)}>Edit</Btn></>}
+            <div style={{marginLeft:"auto"}}><Btn variant="primary" small onClick={saveSnapshot}>📸 Snapshot ({new Date().toLocaleDateString("en-US",{month:"short",year:"numeric"})})</Btn></div>
+          </div>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+// ── Budget Editor ─────────────────────────────────────────────────────────────
+function BudgetEditor({ budget, setBudget }) {
+  const C = useTheme(), isMobile = useIsMobile();
+  const [period, setPeriod] = useState("monthly");
+  const [editingTax, setEditingTax] = useState(false);
+  const [tempTax, setTempTax] = useState(budget.taxes);
+  const [editingGross, setEditingGross] = useState(false);
+  const [tempGross, setTempGross] = useState(budget.grossIncome);
+  const [expandedCat, setExpandedCat] = useState(null);
+  const [editingCat, setEditingCat] = useState(null);
+  const [newItemName, setNewItemName] = useState("");
+  const [newItemAmt, setNewItemAmt] = useState("");
+  const [newItemPeriod, setNewItemPeriod] = useState("both");
+  const [newCatName, setNewCatName] = useState("");
+  const [modalCat, setModalCat] = useState(null);
+
+  const grossForPeriod = period === "monthly" ? budget.grossIncome : budget.grossIncome / 2;
+  const taxForPeriod = period === "monthly" ? budget.taxes : budget.taxes / 2;
+  const netIncome = grossForPeriod - taxForPeriod;
+
+  const savingsCat = budget.categories.find(c => c.id === "savings" || c.name.toLowerCase().includes("saving"));
+  const totalSavings = savingsCat ? sumItemsForPeriod(savingsCat.items, period) : 0;
+  const totalAll = budget.categories.reduce((s, c) => s + sumItemsForPeriod(c.items, period), 0);
+  const totalExpenses = totalAll - totalSavings;
+  const remaining = netIncome - totalAll;
+
+  const pieData = budget.categories.map(c => ({
+    name: c.name,
+    value: sumItemsForPeriod(c.items, period),
+    color: c.color,
+    id: c.id,
+  })).filter(d => d.value > 0);
+
+  const CAT_COLORS = ["#6b9cf7","#d4a847","#9b72e8","#4aba8a","#e0614a","#4ab8c4","#e8a05b"];
+
+  const updateItem = (catId, itemId, f, v) => setBudget(b => ({
+    ...b, categories: b.categories.map(c => c.id !== catId ? c : {
+      ...c, items: c.items.map(i => i.id !== itemId ? i : {
+        ...i, [f]: f === "amount" ? parseFloat(v) || 0 : v
+      })
+    })
+  }));
+
+  const updateItemPeriod = (catId, itemId, newPeriod) => setBudget(b => ({
+    ...b, categories: b.categories.map(c => c.id !== catId ? c : {
+      ...c, items: c.items.map(i => i.id !== itemId ? i : { ...i, period: newPeriod })
+    })
+  }));
+
+  const deleteItem = (catId, itemId) => setBudget(b => ({
+    ...b, categories: b.categories.map(c => c.id !== catId ? c : {
+      ...c, items: c.items.filter(i => i.id !== itemId)
+    })
+  }));
+
+  const addItem = catId => {
+    if (!newItemName.trim()) return;
+    setBudget(b => ({
+      ...b, categories: b.categories.map(c => c.id !== catId ? c : {
+        ...c, items: [...c.items, { id: uid(), name: newItemName.trim(), amount: parseFloat(newItemAmt) || 0, period: newItemPeriod }]
+      })
+    }));
+    setNewItemName(""); setNewItemAmt(""); setNewItemPeriod("both");
+  };
+
+  const deleteCat = id => setBudget(b => ({ ...b, categories: b.categories.filter(c => c.id !== id) }));
+
+  const addCat = () => {
+    if (!newCatName.trim()) return;
+    const color = CAT_COLORS[budget.categories.length % CAT_COLORS.length];
+    setBudget(b => ({ ...b, categories: [...b.categories, { id: uid(), name: newCatName.trim(), color, items: [] }] }));
+    setNewCatName("");
+  };
+
+  const PERIODS = [
+    { key: "1st", label: "1st Paycheck", color: C.blue, badge: "~1st" },
+    { key: "15th", label: "15th Paycheck", color: C.purple, badge: "~15th" },
+    { key: "monthly", label: "Monthly Total", color: C.gold, badge: "Mo" },
+  ];
+
+  const fmtP = v => fmt(v);
+  const periodColor = { "1st": C.blue, "15th": C.purple, "both": C.green };
+
+  return (
+    <div>
+      {modalCat && <DonutModal category={modalCat} period={period} onClose={() => setModalCat(null)} />}
+
+      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: "1rem", gap: "0.5rem", alignItems: "center" }}>
+        <span style={{ fontFamily: "system-ui", fontSize: "0.68rem", color: C.muted }}>View period:</span>
+        <div style={{ display: "flex", background: C.isDark ? C.dim : "#f0f0f0", border: `1px solid ${C.border}`, borderRadius: 9, padding: 3, gap: 2 }}>
+          {PERIODS.map(p => (
+            <button key={p.key} onClick={() => setPeriod(p.key)} style={{
+              background: period === p.key ? (C.isDark ? "#444" : "#fff") : "transparent",
+              color: period === p.key ? (p.key === "1st" ? C.blue : p.key === "15th" ? C.purple : C.gold) : C.sub,
+              border: period === p.key ? `1px solid ${p.key === "1st" ? C.blue : p.key === "15th" ? C.purple : C.gold}` : "1px solid transparent",
+              borderRadius: 6, padding: "5px 13px", fontFamily: "system-ui", fontSize: "0.72rem", fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap",
+            }}>{p.label}</button>
+          ))}
+        </div>
+      </div>
+
+      {period !== "monthly" && (
+        <div style={{
+          background: period === "1st" ? C.blue + "15" : C.purple + "15",
+          border: `1px solid ${period === "1st" ? C.blue : C.purple}33`,
+          borderRadius: 10, padding: "0.6rem 1rem", marginBottom: "1rem",
+          display: "flex", alignItems: "center", gap: "0.6rem",
+        }}>
+          <span style={{ fontSize: "1rem" }}>{period === "1st" ? "1️⃣" : "2️⃣"}</span>
+          <div>
+            <p style={{ margin: 0, fontFamily: "system-ui", fontSize: "0.8rem", fontWeight: 700, color: period === "1st" ? C.blue : C.purple }}>
+              {period === "1st" ? "First Paycheck Period" : "Second Paycheck Period"} — around the {period}
+            </p>
+            <p style={{ margin: 0, fontFamily: "system-ui", fontSize: "0.67rem", color: C.muted }}>
+              Items tagged "both" show half their monthly amount. Items tagged "{period === "1st" ? "15th" : "1st"}" show $0.
+            </p>
+          </div>
+        </div>
+      )}
+
+      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr 1fr" : "repeat(5, 1fr)", gap: "0.75rem", marginBottom: "1.2rem" }}>
+        <KPI label="Gross Income" value={fmtP(grossForPeriod)} sub={period === "monthly" ? "per month" : `${period} paycheck`} color={C.blue} />
+        <KPI label="Net Income" value={fmtP(netIncome)} sub={`after ${fmtP(taxForPeriod)} taxes`} color={C.green} />
+        <KPI label="Total Expenses" value={fmtP(totalExpenses)} sub={`${netIncome > 0 ? ((totalExpenses / netIncome) * 100).toFixed(0) : 0}% of net`} color={C.purple} />
+        <KPI label="Savings" value={fmtP(totalSavings)} sub={`${netIncome > 0 ? ((totalSavings / netIncome) * 100).toFixed(0) : 0}% of net`} color={C.blue} />
+        <KPI label="Remaining" value={fmtP(remaining)} sub={remaining >= 0 ? "surplus ✓" : "deficit ⚠️"} color={remaining >= 0 ? C.gold : C.red} />
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "260px 1fr", gap: "1rem", marginBottom: "1rem" }}>
+        <Card>
+          <Label>Breakdown — tap a slice</Label>
+          <ResponsiveContainer width="100%" height={180}>
+            <PieChart>
+              <Pie data={pieData} cx="50%" cy="50%" innerRadius={44} outerRadius={76} dataKey="value" paddingAngle={3}
+                onClick={d => { const cat = budget.categories.find(c => c.id === d.id || c.name === d.name); if (cat) setModalCat(cat); }}
+                style={{ cursor: "pointer" }}>
+                {pieData.map((e, i) => <Cell key={i} fill={e.color} />)}
+              </Pie>
+              <Tooltip content={<CustomTooltip />} />
+            </PieChart>
+          </ResponsiveContainer>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: "0.35rem", marginTop: "0.3rem" }}>
+            {budget.categories.map(c => (
+              <button key={c.id} onClick={() => setModalCat(c)}
+                style={{ fontSize: "0.62rem", fontFamily: "system-ui", color: c.color, border: `1px solid ${c.color}55`, borderRadius: 20, padding: "2px 8px", background: "transparent", cursor: "pointer" }}>
+                {c.name}
+              </button>
+            ))}
+          </div>
+        </Card>
+
+        <Card style={{ display: "flex", flexDirection: "column", gap: "0.9rem" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <Label>Income Flow</Label>
+            <div style={{ display: "flex", alignItems: "center", gap: "0.4rem", flexWrap: "wrap" }}>
+              {editingTax ? (
+                <><span style={{ fontFamily: "system-ui", fontSize: "0.62rem", color: C.muted }}>taxes/mo:</span>
+                  <input type="number" value={tempTax} onChange={e => setTempTax(e.target.value)} style={{ width: 82, background: C.inputBg, border: `1px solid ${C.border}`, borderRadius: 6, color: C.red, fontFamily: "system-ui", fontSize: "0.72rem", padding: "3px 6px", outline: "none" }} />
+                  <Btn small variant="primary" onClick={() => { setBudget(b => ({ ...b, taxes: parseFloat(tempTax) || 0 })); setEditingTax(false); }}>Save</Btn>
+                  <Btn small onClick={() => setEditingTax(false)}>✕</Btn></>
+              ) : (
+                <button onClick={() => { setTempTax(budget.taxes); setEditingTax(true); }} style={{ background: "none", border: "none", cursor: "pointer", color: C.muted, fontFamily: "system-ui", fontSize: "0.62rem", display: "flex", alignItems: "center", gap: "3px", padding: "2px 4px", borderRadius: 4 }}>
+                  <span>taxes {fmt(budget.taxes)}/mo</span><span style={{ fontSize: "0.55rem" }}>✏️</span>
+                </button>
+              )}
+              {editingGross ? (
+                <><span style={{ fontFamily: "system-ui", fontSize: "0.62rem", color: C.muted }}>gross/mo:</span>
+                  <input type="number" value={tempGross} onChange={e => setTempGross(e.target.value)} style={{ width: 90, background: C.inputBg, border: `1px solid ${C.border}`, borderRadius: 6, color: C.blue, fontFamily: "system-ui", fontSize: "0.72rem", padding: "3px 6px", outline: "none" }} />
+                  <Btn small variant="primary" onClick={() => { setBudget(b => ({ ...b, grossIncome: parseFloat(tempGross) || 0 })); setEditingGross(false); }}>Save</Btn>
+                  <Btn small onClick={() => setEditingGross(false)}>✕</Btn></>
+              ) : (
+                <button onClick={() => { setTempGross(budget.grossIncome); setEditingGross(true); }} style={{ background: "none", border: "none", cursor: "pointer", color: C.muted, fontFamily: "system-ui", fontSize: "0.62rem", display: "flex", alignItems: "center", gap: "3px", padding: "2px 4px", borderRadius: 4 }}>
+                  <span>gross {fmt(budget.grossIncome)}/mo</span><span style={{ fontSize: "0.55rem" }}>✏️</span>
+                </button>
+              )}
+            </div>
+          </div>
+          {(() => {
+            const gross = grossForPeriod, tax = taxForPeriod, net = netIncome;
+            const livingSpending = totalExpenses, savings = totalSavings;
+            const afterExpenses = net - livingSpending, afterSavings = afterExpenses - savings;
+            const steps = [
+              { label: "Gross Income", value: gross, color: C.blue, barPct: 100, note: null },
+              { label: "After Taxes", value: net, color: C.green, barPct: (net / gross) * 100, note: { label: "Taxes", amount: tax, color: C.red } },
+              { label: "After Expenses", value: afterExpenses, color: "#4ab8c4", barPct: Math.max((afterExpenses / gross) * 100, 0), note: { label: "Living/Spending", amount: livingSpending, color: C.purple } },
+              { label: "After Savings", value: afterSavings, color: afterSavings >= 0 ? C.gold : C.red, barPct: Math.max((afterSavings / gross) * 100, 0), note: { label: "Savings", amount: savings, color: "#6b9cf7" } },
+            ];
+            return (
+              <div style={{ display: "flex", flexDirection: "column", gap: "0.55rem" }}>
+                {steps.map(step => (
+                  <div key={step.label}>
+                    {step.note && <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.3rem", paddingLeft: "0.2rem" }}>
+                      <div style={{ width: 1, height: 14, background: C.border, marginLeft: 6 }} />
+                      <span style={{ fontFamily: "system-ui", fontSize: "0.65rem", color: step.note.color, fontWeight: 600 }}>− {fmt(step.note.amount)}</span>
+                      <span style={{ fontFamily: "system-ui", fontSize: "0.62rem", color: C.muted }}>{step.note.label}</span>
+                    </div>}
+                    <div style={{ display: "flex", alignItems: "center", gap: "0.65rem" }}>
+                      <div style={{ width: isMobile ? 70 : 90, flexShrink: 0 }}>
+                        <p style={{ margin: 0, fontFamily: "system-ui", fontSize: "0.62rem", color: C.sub, whiteSpace: "nowrap" }}>{step.label}</p>
+                      </div>
+                      <div style={{ flex: 1, height: 32, background: C.isDark ? C.surface : C.dim, borderRadius: 6, overflow: "hidden", position: "relative" }}>
+                        <div style={{ height: "100%", width: `${step.barPct}%`, background: step.color, borderRadius: 6, transition: "width 0.6s ease", display: "flex", alignItems: "center", paddingLeft: "0.5rem", boxSizing: "border-box" }}>
+                          {step.barPct > 12 && <span style={{ fontFamily: "system-ui", fontSize: "0.68rem", fontWeight: 700, color: "rgba(255,255,255,0.95)", textShadow: "0 1px 3px rgba(0,0,0,0.35)", whiteSpace: "nowrap" }}>{fmt(step.value)}</span>}
+                        </div>
+                        {step.barPct <= 12 && <span style={{ position: "absolute", left: `${step.barPct + 1}%`, top: "50%", transform: "translateY(-50%)", fontFamily: "system-ui", fontSize: "0.68rem", fontWeight: 700, color: step.color, whiteSpace: "nowrap" }}>{fmt(step.value)}</span>}
+                      </div>
+                      <div style={{ width: 36, flexShrink: 0, textAlign: "right" }}>
+                        <span style={{ fontFamily: "system-ui", fontSize: "0.65rem", fontWeight: 600, color: step.color }}>{step.barPct.toFixed(0)}%</span>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            );
+          })()}
+        </Card>
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: "0.6rem" }}>
+        {budget.categories.map(cat => {
+          const catTotal = sumItemsForPeriod(cat.items, period);
+          const pct = netIncome > 0 ? ((catTotal / netIncome) * 100).toFixed(1) : 0;
+          const isOpen = expandedCat === cat.id;
+
+          return (
+            <Card key={cat.id} style={{ padding: 0, overflow: "hidden" }}>
+              <div onClick={() => { setExpandedCat(isOpen ? null : cat.id); if (isOpen) setEditingCat(null); }}
+                style={{ display: "flex", alignItems: "center", gap: "0.75rem", padding: "0.8rem 1rem", cursor: "pointer" }}>
+                <div style={{ width: 10, height: 10, borderRadius: "50%", background: cat.color, flexShrink: 0 }} />
+                <span style={{ flex: 1, fontFamily: "system-ui", fontSize: "0.85rem", color: C.text, fontWeight: 600, minWidth: 0 }}>{cat.name}</span>
+                <span style={{ fontFamily: "system-ui", fontSize: "0.68rem", color: C.sub, whiteSpace: "nowrap" }}>{pct}%</span>
+                <span style={{ fontFamily: "system-ui", fontSize: "0.9rem", fontWeight: 700, color: cat.color, whiteSpace: "nowrap" }}>{fmtP(catTotal)}</span>
+                <span style={{ color: C.muted, fontSize: "0.7rem" }}>{isOpen ? "▲" : "▼"}</span>
+              </div>
+              <div style={{ height: 3, background: C.isDark ? C.surface : C.dim }}>
+                <div style={{ height: "100%", width: `${Math.min(Number(pct), 100)}%`, background: cat.color }} />
+              </div>
+
+              {isOpen && (
+                <div style={{ padding: "0.8rem 1rem 1rem", borderTop: `1px solid ${C.border}` }}>
+                  {editingCat !== cat.id ? (
+                    <>
+                      <div style={{ display: "flex", flexDirection: "column", gap: "0.3rem", marginBottom: "0.75rem" }}>
+                        {cat.items.map(item => {
+                          const displayAmt = itemAmountForPeriod(item, period);
+                          const isZero = displayAmt === 0;
+                          const p = item.period || "both";
+                          return (
+                            <div key={item.id} style={{
+                              display: "flex", alignItems: "center", justifyContent: "space-between",
+                              padding: "0.35rem 0.5rem", borderRadius: 6,
+                              background: isZero ? (C.isDark ? C.surface + "80" : C.dim + "80") : "transparent",
+                              opacity: isZero ? 0.45 : 1,
+                            }}>
+                              <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", flex: 1, minWidth: 0 }}>
+                                <span style={{ fontFamily: "system-ui", fontSize: "0.78rem", color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.name}</span>
+                                <span style={{
+                                  fontFamily: "system-ui", fontSize: "0.58rem", fontWeight: 700, flexShrink: 0,
+                                  color: periodColor[p], background: periodColor[p] + "22",
+                                  borderRadius: 4, padding: "1px 5px",
+                                }}>{p}</span>
+                              </div>
+                              <span style={{ fontFamily: "system-ui", fontSize: "0.8rem", fontWeight: 600, color: isZero ? C.muted : cat.color, flexShrink: 0, marginLeft: "0.5rem" }}>
+                                {isZero ? "—" : fmtP(displayAmt)}
+                              </span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                      <div style={{ display: "flex", gap: "0.4rem" }}>
+                        <Btn small onClick={() => { setEditingCat(cat.id); setNewItemName(""); setNewItemAmt(""); setNewItemPeriod("both"); }}>✏️ Edit</Btn>
+                        <Btn small variant="danger" onClick={() => deleteCat(cat.id)}>Delete Category</Btn>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.75rem", padding: "0.5rem 0.6rem", background: C.isDark ? C.surface : C.dim, borderRadius: 8 }}>
+                        <span style={{ fontFamily: "system-ui", fontSize: "0.65rem", color: C.sub, whiteSpace: "nowrap" }}>Category color</span>
+                        <div style={{ display: "flex", gap: "0.3rem", flexWrap: "wrap" }}>
+                          {["#6b9cf7","#d4a847","#9b72e8","#4aba8a","#e0614a","#4ab8c4","#e8a05b","#f7931a","#e87db0","#7dd87d"].map(col => (
+                            <button key={col} onClick={() => setBudget(b => ({ ...b, categories: b.categories.map(c => c.id !== cat.id ? c : { ...c, color: col }) }))}
+                              style={{ width: 18, height: 18, borderRadius: "50%", background: col, border: cat.color === col ? `2px solid ${C.text}` : "2px solid transparent", cursor: "pointer", padding: 0, flexShrink: 0 }} />
+                          ))}
+                          <input type="color" value={cat.color} onChange={e => setBudget(b => ({ ...b, categories: b.categories.map(c => c.id !== cat.id ? c : { ...c, color: e.target.value }) }))}
+                            style={{ width: 18, height: 18, borderRadius: "50%", border: `2px solid ${C.border}`, cursor: "pointer", padding: 0, background: "none", outline: "none" }} />
+                        </div>
+                      </div>
+
+                      <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem", marginBottom: "0.75rem" }}>
+                        {cat.items.map(item => (
+                          <div key={item.id} style={{ display: "flex", alignItems: "center", gap: "0.4rem", flexWrap: "wrap", background: C.isDark ? C.surface : C.dim, borderRadius: 8, padding: "0.4rem 0.5rem" }}>
+                            <input value={item.name} onChange={e => updateItem(cat.id, item.id, "name", e.target.value)}
+                              style={{ flex: 1, minWidth: 100, background: C.inputBg, border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, fontFamily: "system-ui", fontSize: "0.74rem", padding: "4px 7px", outline: "none" }} />
+                            <input type="number" value={item.amount} onChange={e => updateItem(cat.id, item.id, "amount", e.target.value)}
+                              style={{ width: 90, background: C.inputBg, border: `1px solid ${C.border}`, borderRadius: 6, color: cat.color, fontFamily: "system-ui", fontSize: "0.74rem", padding: "4px 7px", outline: "none", boxSizing: "border-box" }} />
+                            <PeriodPill value={item.period || "both"} onChange={v => updateItemPeriod(cat.id, item.id, v)} />
+                            <button onClick={() => deleteItem(cat.id, item.id)}
+                              style={{ background: "none", border: "none", color: C.red, cursor: "pointer", fontSize: "1rem", padding: "0 2px", flexShrink: 0 }}>×</button>
+                          </div>
+                        ))}
+                      </div>
+
+                      <div style={{ display: "flex", gap: "0.4rem", flexWrap: "wrap", paddingTop: "0.5rem", borderTop: `1px solid ${C.border}`, alignItems: "center" }}>
+                        <TInput value={newItemName} onChange={setNewItemName} placeholder="Item name..." />
+                        <TInput type="number" value={newItemAmt} onChange={setNewItemAmt} placeholder="Monthly $" style={{ width: 95 }} />
+                        <PeriodPill value={newItemPeriod} onChange={setNewItemPeriod} />
+                        <Btn small variant="primary" onClick={() => addItem(cat.id)}>+ Add</Btn>
+                        <Btn small onClick={() => setEditingCat(null)}>✓ Done</Btn>
+                        <Btn small variant="danger" onClick={() => { deleteCat(cat.id); setEditingCat(null); }}>Delete</Btn>
+                      </div>
+                      <p style={{ margin: "0.5rem 0 0", fontFamily: "system-ui", fontSize: "0.62rem", color: C.muted }}>
+                        💡 Enter the <strong>monthly</strong> amount. "Both" = split evenly per paycheck. "1st" or "15th" = full amount that paycheck only.
+                      </p>
+                    </>
+                  )}
+                </div>
+              )}
+            </Card>
+          );
+        })}
+      </div>
+
+      <div style={{ marginTop: "2rem", paddingTop: "1.5rem", borderTop: `1px solid ${C.border}` }}>
+        <p style={{ fontFamily: "system-ui", fontSize: "0.68rem", color: C.muted, textAlign: "center", letterSpacing: "0.08em", textTransform: "uppercase", margin: "0 0 0.75rem" }}>Add a new category</p>
+        <div style={{ display: "flex", gap: "0.5rem", maxWidth: 400, margin: "0 auto" }}>
+          <TInput value={newCatName} onChange={setNewCatName} placeholder="Category name..." />
+          <Btn variant="primary" onClick={addCat}>+ Add</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── HEALTH TRACKER ────────────────────────────────────────────────────────────
+const RANGE_OPTIONS = [
+  { label: "1W", days: 7 },
+  { label: "1M", days: 30 },
+  { label: "3M", days: 90 },
+  { label: "6M", days: 180 },
+  { label: "1Y", days: 365 },
+];
+
+function filterByRange(logs, days, dateKey="date") {
+  const cutoff = subDays(today(), days);
+  return logs.filter(l => l[dateKey] >= cutoff).sort((a,b)=>a[dateKey].localeCompare(b[dateKey]));
+}
+
+function RangeToggle({ value, onChange }) {
+  const C = useTheme();
+  return (
+    <div style={{display:"flex",background:C.isDark?C.dim:"#f0f0f0",border:`1px solid ${C.border}`,borderRadius:9,padding:3,gap:2}}>
+      {RANGE_OPTIONS.map(r=>(
+        <button key={r.label} onClick={()=>onChange(r.days)} style={{background:value===r.days?C.isDark?"#444":"#fff":"transparent",color:value===r.days?C.text:C.sub,border:value===r.days?`1px solid ${C.border}`:"1px solid transparent",borderRadius:6,padding:"4px 10px",fontFamily:"system-ui",fontSize:"0.7rem",fontWeight:600,cursor:"pointer"}}>{r.label}</button>
+      ))}
+    </div>
+  );
+}
+
+function WeightSection({ health, setHealth }) {
+  const C = useTheme();
+  const [range, setRange] = useState(30);
+  const [newWeight, setNewWeight] = useState("");
+  const [newDate, setNewDate] = useState(today());
+  const [unit, setUnit] = useState(health.weightUnit || "lbs");
+  const logs = useMemo(() => filterByRange(health.weightLog, range), [health.weightLog, range]);
+  const chartData = logs.map(l => ({ date: fmtDate(l.date), weight: Number(l.weight), label: fmtDate(l.date) }));
+  const addEntry = () => {
+    if (!newWeight) return;
+    const entry = { id: uid(), date: newDate, weight: parseFloat(newWeight) };
+    setHealth(h => ({ ...h, weightLog: [...h.weightLog, entry].sort((a,b)=>a.date.localeCompare(b.date)), weightUnit: unit }));
+    setNewWeight("");
+  };
+  const allSorted = [...health.weightLog].sort((a,b)=>a.date.localeCompare(b.date));
+  const latest = allSorted[allSorted.length - 1];
+  const first = allSorted[0];
+  const change = latest && first && latest.id !== first.id ? (Number(latest.weight) - Number(first.weight)).toFixed(1) : null;
+  const minW = logs.length ? Math.min(...logs.map(l=>Number(l.weight))) : 0;
+  const maxW = logs.length ? Math.max(...logs.map(l=>Number(l.weight))) : 0;
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:"1rem"}}>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:"0.75rem"}}>
+        <KPI label="Current Weight" value={latest?`${latest.weight} ${unit}`:"—"} sub={latest?fmtDate(latest.date):"no data"} color={C.blue}/>
+        <KPI label="Range" value={logs.length?`${minW} – ${maxW} ${unit}`:"—"} sub="in selected period" color={C.purple}/>
+        <KPI label="Total Change" value={change?`${change>0?"+":""}${change} ${unit}`:"—"} sub="all time" color={Number(change)<0?C.green:C.red}/>
+      </div>
+      <Card>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"1rem",flexWrap:"wrap",gap:"0.5rem"}}>
+          <Label>Weight Over Time</Label><RangeToggle value={range} onChange={setRange}/>
+        </div>
+        {chartData.length < 2 ? <div style={{padding:"2rem",textAlign:"center",color:C.muted,fontFamily:"system-ui",fontSize:"0.8rem"}}>Log at least 2 entries to see your chart.</div>
+        : <ResponsiveContainer width="100%" height={220}><AreaChart data={chartData} margin={{top:8,right:8,left:0,bottom:0}}><defs><linearGradient id="wGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={C.blue} stopOpacity={0.25}/><stop offset="95%" stopColor={C.blue} stopOpacity={0}/></linearGradient></defs><CartesianGrid strokeDasharray="3 3" stroke={C.border}/><XAxis dataKey="date" tick={{fill:C.sub,fontFamily:"system-ui",fontSize:10}} axisLine={false} tickLine={false}/><YAxis tick={{fill:C.sub,fontFamily:"system-ui",fontSize:10}} axisLine={false} tickLine={false} domain={["auto","auto"]}/><Tooltip content={<CustomTooltip/>}/><Area type="monotone" dataKey="weight" stroke={C.blue} strokeWidth={2.5} fill="url(#wGrad)" dot={{fill:C.blue,r:3,strokeWidth:0}} name={`Weight (${unit})`}/></AreaChart></ResponsiveContainer>}
+      </Card>
+      <Card>
+        <Label>Log Weight</Label>
+        <div style={{display:"flex",gap:"0.5rem",flexWrap:"wrap",marginTop:"0.5rem",alignItems:"center"}}>
+          <TInput type="date" value={newDate} onChange={setNewDate} style={{width:145}}/>
+          <TInput type="number" value={newWeight} onChange={setNewWeight} placeholder={`Weight in ${unit}`} style={{width:150}}/>
+          <Select value={unit} onChange={v=>{setUnit(v);setHealth(h=>({...h,weightUnit:v}));}}><option value="lbs">lbs</option><option value="kg">kg</option></Select>
+          <Btn variant="primary" onClick={addEntry}>+ Log</Btn>
+        </div>
+        {health.weightLog.length > 0 && (
+          <div style={{marginTop:"1rem",display:"flex",flexDirection:"column",gap:"0.3rem",maxHeight:200,overflowY:"auto"}}>
+            {[...health.weightLog].sort((a,b)=>b.date.localeCompare(a.date)).map(l=>(
+              <div key={l.id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"0.3rem 0.5rem",background:C.isDark?C.surface:C.dim,borderRadius:6}}>
+                <span style={{fontFamily:"system-ui",fontSize:"0.75rem",color:C.sub}}>{fmtDate(l.date)}</span>
+                <span style={{fontFamily:"system-ui",fontSize:"0.82rem",fontWeight:700,color:C.blue}}>{l.weight} {unit}</span>
+                <button onClick={()=>setHealth(h=>({...h,weightLog:h.weightLog.filter(x=>x.id!==l.id)}))} style={{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:"0.85rem"}}>×</button>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+function LiftingSection({ health, setHealth }) {
+  const C = useTheme(), isMobile = useIsMobile();
+  const [range, setRange] = useState(30);
+  const [activeEx, setActiveEx] = useState(null);
+  const [logDate, setLogDate] = useState(today());
+  const [sets, setSets] = useState([{ reps: "", weight: "" }]);
+  const [showAddEx, setShowAddEx] = useState(false);
+  const [newExName, setNewExName] = useState("");
+  const [newExCat, setNewExCat] = useState("upper");
+  const [newExBW, setNewExBW] = useState(false);
+  const [catFilter, setCatFilter] = useState("all");
+  const [showPresets, setShowPresets] = useState(false);
+  const [presetCat, setPresetCat] = useState("upper");
+  const exercises = health.exercises || [];
+  const workoutLogs = health.workoutLogs || [];
+  const addExercise = () => {
+    if (!newExName.trim()) return;
+    setHealth(h=>({...h,exercises:[...h.exercises,{id:uid(),name:newExName.trim(),category:newExCat,isBodyweight:newExBW}]}));
+    setNewExName(""); setShowAddEx(false);
+  };
+  const addPreset = (name, cat) => {
+    if (exercises.find(e=>e.name===name)) return;
+    setHealth(h=>({...h,exercises:[...h.exercises,{id:uid(),name,category:cat,isBodyweight:BODYWEIGHT_EXERCISES.has(name)}]}));
+  };
+  const logWorkout = () => {
+    if (!activeEx || sets.every(s=>!s.reps&&!s.weight)) return;
+    const validSets = sets.filter(s=>s.reps||s.weight).map(s=>({reps:Number(s.reps)||0,weight:Number(s.weight)||0}));
+    setHealth(h=>({...h,workoutLogs:[...h.workoutLogs,{id:uid(),date:logDate,exerciseId:activeEx,sets:validSets}]}));
+    setSets([{reps:"",weight:""}]);
+  };
+  const selEx = exercises.find(e=>e.id===activeEx);
+  const filtered = catFilter==="all"?exercises:exercises.filter(e=>e.category===catFilter);
+  const exLogs = useMemo(()=>{
+    if (!activeEx) return [];
+    return filterByRange(workoutLogs.filter(l=>l.exerciseId===activeEx), range);
+  }, [activeEx, workoutLogs, range]);
+  const chartData = exLogs.map(l=>({
+    date: fmtDate(l.date),
+    maxWeight: Math.max(...l.sets.map(s=>s.weight||0)),
+    totalReps: l.sets.reduce((s,x)=>s+x.reps,0),
+    volume: l.sets.reduce((s,x)=>s+(x.reps*(x.weight||0)),0),
+  }));
+  const allTimePR = workoutLogs.filter(l=>l.exerciseId===activeEx).flatMap(l=>l.sets.map(s=>s.weight||0));
+  const pr = allTimePR.length ? Math.max(...allTimePR) : null;
+  const CAT_COLORS_MAP = { upper: C.blue, lower: C.green, cardio: C.teal };
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:"1rem"}}>
+      <Card>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"0.75rem",flexWrap:"wrap",gap:"0.5rem"}}>
+          <Label>Exercise Library</Label>
+          <div style={{display:"flex",gap:"0.4rem"}}>
+            <Btn small onClick={()=>{setShowPresets(p=>!p);setShowAddEx(false);}}>📋 Presets</Btn>
+            <Btn small variant="primary" onClick={()=>{setShowAddEx(p=>!p);setShowPresets(false);}}>+ Custom</Btn>
+          </div>
+        </div>
+        {showPresets && (
+          <div style={{background:C.isDark?C.surface:C.dim,borderRadius:10,padding:"0.8rem",marginBottom:"0.75rem"}}>
+            <div style={{display:"flex",gap:"0.4rem",marginBottom:"0.6rem"}}>
+              {["upper","lower"].map(c=><button key={c} onClick={()=>setPresetCat(c)} style={{background:presetCat===c?CAT_COLORS_MAP[c]:"transparent",color:presetCat===c?"#fff":C.sub,border:`1px solid ${presetCat===c?CAT_COLORS_MAP[c]:C.border}`,borderRadius:6,padding:"4px 10px",fontFamily:"system-ui",fontSize:"0.7rem",fontWeight:600,cursor:"pointer",textTransform:"capitalize"}}>{c==="upper"?"Upper Body":"Lower Body"}</button>)}
+            </div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:"0.4rem"}}>
+              {PRESET_EXERCISES[presetCat].map(name=>{
+                const already=exercises.find(e=>e.name===name);
+                return <button key={name} onClick={()=>addPreset(name,presetCat)} disabled={!!already} style={{background:already?C.isDark?C.dim:C.dim:CAT_COLORS_MAP[presetCat]+"22",color:already?C.muted:CAT_COLORS_MAP[presetCat],border:`1px solid ${CAT_COLORS_MAP[presetCat]}44`,borderRadius:20,padding:"3px 10px",fontFamily:"system-ui",fontSize:"0.7rem",cursor:already?"default":"pointer",opacity:already?0.5:1}}>{already?"✓ ":""}{name}</button>;
+              })}
+            </div>
+          </div>
+        )}
+        {showAddEx && (
+          <div style={{display:"flex",gap:"0.5rem",flexWrap:"wrap",marginBottom:"0.75rem",padding:"0.7rem",background:C.isDark?C.surface:C.dim,borderRadius:8,alignItems:"center"}}>
+            <TInput value={newExName} onChange={setNewExName} placeholder="Exercise name..."/>
+            <Select value={newExCat} onChange={setNewExCat} style={{minWidth:120}}><option value="upper">Upper Body</option><option value="lower">Lower Body</option></Select>
+            <label style={{display:"flex",alignItems:"center",gap:"0.3rem",fontFamily:"system-ui",fontSize:"0.72rem",color:C.sub,cursor:"pointer"}}><input type="checkbox" checked={newExBW} onChange={e=>setNewExBW(e.target.checked)}/> Bodyweight</label>
+            <Btn small variant="primary" onClick={addExercise}>Add</Btn>
+          </div>
+        )}
+        <div style={{display:"flex",gap:"0.4rem",marginBottom:"0.6rem"}}>
+          {["all","upper","lower"].map(f=>(
+            <button key={f} onClick={()=>setCatFilter(f)} style={{background:catFilter===f?(f==="all"?C.gold:CAT_COLORS_MAP[f]):"transparent",color:catFilter===f?"#fff":C.sub,border:`1px solid ${catFilter===f?(f==="all"?C.gold:CAT_COLORS_MAP[f]):C.border}`,borderRadius:6,padding:"4px 10px",fontFamily:"system-ui",fontSize:"0.7rem",fontWeight:600,cursor:"pointer",textTransform:"capitalize"}}>{f==="all"?"All":f==="upper"?"Upper Body":"Lower Body"}</button>
+          ))}
+        </div>
+        <div style={{display:"flex",flexWrap:"wrap",gap:"0.4rem"}}>
+          {filtered.length===0&&<span style={{fontFamily:"system-ui",fontSize:"0.75rem",color:C.muted}}>No exercises yet. Add presets or a custom one above.</span>}
+          {filtered.map(ex=>{
+            const col=CAT_COLORS_MAP[ex.category]||C.sub;
+            const logs=workoutLogs.filter(l=>l.exerciseId===ex.id);
+            const pr=logs.flatMap(l=>l.sets.map(s=>s.weight||0));
+            const maxPR=pr.length?Math.max(...pr):null;
+            return (
+              <button key={ex.id} onClick={()=>setActiveEx(activeEx===ex.id?null:ex.id)}
+                style={{display:"flex",flexDirection:"column",alignItems:"flex-start",background:activeEx===ex.id?col+"33":C.isDark?C.surface:C.dim,border:`1.5px solid ${activeEx===ex.id?col:C.border}`,borderRadius:10,padding:"0.5rem 0.8rem",cursor:"pointer",minWidth:130,transition:"all 0.15s"}}>
+                <span style={{fontFamily:"system-ui",fontSize:"0.75rem",fontWeight:700,color:activeEx===ex.id?col:C.text}}>{ex.name}</span>
+                <span style={{fontFamily:"system-ui",fontSize:"0.6rem",color:C.muted}}>{ex.isBodyweight?"Bodyweight":maxPR?`PR: ${maxPR} lbs`:"No logs yet"}</span>
+                <div style={{display:"flex",gap:"0.3rem",marginTop:"0.2rem"}}><span style={{fontFamily:"system-ui",fontSize:"0.58rem",color:col,background:col+"22",borderRadius:4,padding:"1px 5px"}}>{ex.category==="upper"?"Upper":"Lower"}</span>{ex.isBodyweight&&<span style={{fontFamily:"system-ui",fontSize:"0.58rem",color:C.gold,background:C.gold+"22",borderRadius:4,padding:"1px 5px"}}>BW</span>}</div>
+              </button>
+            );
+          })}
+        </div>
+      </Card>
+      {activeEx && selEx && (
+        <Card>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"0.75rem",flexWrap:"wrap",gap:"0.5rem"}}>
+            <div><Label>Log — {selEx.name}</Label>{pr!==null&&!selEx.isBodyweight&&<span style={{fontFamily:"system-ui",fontSize:"0.7rem",color:C.gold}}>🏆 All-time PR: {pr} lbs</span>}</div>
+            <TInput type="date" value={logDate} onChange={setLogDate} style={{width:145}}/>
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:"0.4rem",marginBottom:"0.75rem"}}>
+            <div style={{display:"grid",gridTemplateColumns:selEx.isBodyweight?"1fr 60px":"1fr 1fr 60px",gap:"0.4rem",marginBottom:"0.2rem"}}>
+              <span style={{fontFamily:"system-ui",fontSize:"0.65rem",color:C.muted}}>Reps</span>
+              {!selEx.isBodyweight&&<span style={{fontFamily:"system-ui",fontSize:"0.65rem",color:C.muted}}>Weight (lbs)</span>}
+              <span/>
+            </div>
+            {sets.map((s,i)=>(
+              <div key={i} style={{display:"grid",gridTemplateColumns:selEx.isBodyweight?"1fr 60px":"1fr 1fr 60px",gap:"0.4rem",alignItems:"center"}}>
+                <TInput type="number" value={s.reps} onChange={v=>setSets(ss=>ss.map((x,j)=>j===i?{...x,reps:v}:x))} placeholder={`Set ${i+1} reps`}/>
+                {!selEx.isBodyweight&&<TInput type="number" value={s.weight} onChange={v=>setSets(ss=>ss.map((x,j)=>j===i?{...x,weight:v}:x))} placeholder="lbs"/>}
+                <button onClick={()=>setSets(ss=>ss.length>1?ss.filter((_,j)=>j!==i):[{reps:"",weight:""}])} style={{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:"1.1rem"}}>×</button>
+              </div>
+            ))}
+          </div>
+          <div style={{display:"flex",gap:"0.4rem"}}>
+            <Btn small onClick={()=>setSets(s=>[...s,{reps:"",weight:""}])}>+ Set</Btn>
+            <Btn small variant="primary" onClick={logWorkout}>💾 Log Workout</Btn>
+          </div>
+        </Card>
+      )}
+      {activeEx && (
+        <Card>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"1rem",flexWrap:"wrap",gap:"0.5rem"}}>
+            <Label>Progress — {selEx?.name}</Label><RangeToggle value={range} onChange={setRange}/>
+          </div>
+          {chartData.length<1?<div style={{padding:"2rem",textAlign:"center",color:C.muted,fontFamily:"system-ui",fontSize:"0.8rem"}}>No workout logs in this range yet.</div>
+          :<ResponsiveContainer width="100%" height={220}><LineChart data={chartData} margin={{top:8,right:8,left:0,bottom:0}}><CartesianGrid strokeDasharray="3 3" stroke={C.border}/><XAxis dataKey="date" tick={{fill:C.sub,fontFamily:"system-ui",fontSize:10}} axisLine={false} tickLine={false}/><YAxis tick={{fill:C.sub,fontFamily:"system-ui",fontSize:10}} axisLine={false} tickLine={false}/><Tooltip content={<CustomTooltip/>}/>{!selEx?.isBodyweight&&<Line type="monotone" dataKey="maxWeight" stroke={C.blue} strokeWidth={2.5} dot={{fill:C.blue,r:4,strokeWidth:0}} name="Max Weight (lbs)"/>}<Line type="monotone" dataKey="totalReps" stroke={C.green} strokeWidth={2} dot={{fill:C.green,r:3,strokeWidth:0}} name="Total Reps"/></LineChart></ResponsiveContainer>}
+          {exLogs.length>0&&(
+            <div style={{marginTop:"1rem",display:"flex",flexDirection:"column",gap:"0.4rem",maxHeight:220,overflowY:"auto"}}>
+              <Label>Recent Sessions</Label>
+              {[...exLogs].sort((a,b)=>b.date.localeCompare(a.date)).map(l=>(
+                <div key={l.id} style={{background:C.isDark?C.surface:C.dim,borderRadius:8,padding:"0.5rem 0.75rem"}}>
+                  <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"0.3rem"}}>
+                    <span style={{fontFamily:"system-ui",fontSize:"0.72rem",color:C.sub}}>{fmtDate(l.date)}</span>
+                    <div style={{display:"flex",gap:"0.6rem"}}>
+                      {!selEx?.isBodyweight&&<span style={{fontFamily:"system-ui",fontSize:"0.7rem",color:C.blue}}>Max: {Math.max(...l.sets.map(s=>s.weight||0))} lbs</span>}
+                      <span style={{fontFamily:"system-ui",fontSize:"0.7rem",color:C.green}}>Reps: {l.sets.reduce((s,x)=>s+x.reps,0)}</span>
+                    </div>
+                    <button onClick={()=>setHealth(h=>({...h,workoutLogs:h.workoutLogs.filter(x=>x.id!==l.id)}))} style={{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:"0.85rem"}}>×</button>
+                  </div>
+                  <div style={{display:"flex",gap:"0.4rem",flexWrap:"wrap"}}>
+                    {l.sets.map((s,i)=>(
+                      <span key={i} style={{fontFamily:"system-ui",fontSize:"0.65rem",color:C.text,background:C.isDark?C.dim:C.border,borderRadius:4,padding:"2px 7px"}}>
+                        {selEx?.isBodyweight?`${s.reps} reps`:`${s.reps}×${s.weight}lbs`}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </Card>
+      )}
+    </div>
+  );
+}
+
+function CardioSection({ health, setHealth }) {
+  const C = useTheme();
+  const [range, setRange] = useState(30);
+  const [date, setDate] = useState(today());
+  const [dist, setDist] = useState("");
+  const [dur, setDur] = useState("");
+  const [unit, setUnit] = useState("mi");
+  const logs = useMemo(()=>filterByRange(health.cardioLogs||[], range), [health.cardioLogs, range]);
+  const chartData = logs.map(l=>({date:fmtDate(l.date),distance:Number(l.distance),pace:l.duration&&l.distance?parseFloat((l.duration/l.distance).toFixed(2)):null}));
+  const addLog = () => {
+    if (!dist) return;
+    setHealth(h=>({...h,cardioLogs:[...(h.cardioLogs||[]),{id:uid(),date,distance:parseFloat(dist),duration:parseFloat(dur)||null,unit}]}));
+    setDist(""); setDur("");
+  };
+  const allLogs = health.cardioLogs || [];
+  const totalDist = allLogs.reduce((s,l)=>s+Number(l.distance||0),0);
+  const longestRun = allLogs.length?Math.max(...allLogs.map(l=>Number(l.distance||0))):null;
+  const bestPace = allLogs.filter(l=>l.duration&&l.distance).map(l=>l.duration/l.distance);
+  const fastestPace = bestPace.length?Math.min(...bestPace):null;
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:"1rem"}}>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:"0.75rem"}}>
+        <KPI label="Total Distance" value={totalDist?`${totalDist.toFixed(1)} mi`:"—"} sub="all time" color={C.teal}/>
+        <KPI label="Longest Run" value={longestRun?`${longestRun} mi`:"—"} sub="all time" color={C.purple}/>
+        <KPI label="Fastest Pace" value={fastestPace?pace(1,fastestPace):"—"} sub="per mile" color={C.gold}/>
+      </div>
+      <Card>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"1rem",flexWrap:"wrap",gap:"0.5rem"}}>
+          <Label>Distance & Pace Over Time</Label><RangeToggle value={range} onChange={setRange}/>
+        </div>
+        {chartData.length<1?<div style={{padding:"2rem",textAlign:"center",color:C.muted,fontFamily:"system-ui",fontSize:"0.8rem"}}>No cardio logs in this range yet.</div>
+        :<ResponsiveContainer width="100%" height={220}><LineChart data={chartData} margin={{top:8,right:8,left:0,bottom:0}}><CartesianGrid strokeDasharray="3 3" stroke={C.border}/><XAxis dataKey="date" tick={{fill:C.sub,fontFamily:"system-ui",fontSize:10}} axisLine={false} tickLine={false}/><YAxis yAxisId="dist" tick={{fill:C.teal,fontFamily:"system-ui",fontSize:10}} axisLine={false} tickLine={false}/><YAxis yAxisId="pace" orientation="right" tick={{fill:C.purple,fontFamily:"system-ui",fontSize:10}} axisLine={false} tickLine={false}/><Tooltip content={<CustomTooltip/>}/><Legend wrapperStyle={{fontFamily:"system-ui",fontSize:"0.7rem"}}/><Line yAxisId="dist" type="monotone" dataKey="distance" stroke={C.teal} strokeWidth={2.5} dot={{fill:C.teal,r:4,strokeWidth:0}} name="Distance (mi)"/><Line yAxisId="pace" type="monotone" dataKey="pace" stroke={C.purple} strokeWidth={2} dot={{fill:C.purple,r:3,strokeWidth:0}} name="Pace (min/mi)"/></LineChart></ResponsiveContainer>}
+      </Card>
+      <Card>
+        <Label>Log a Run</Label>
+        <div style={{display:"flex",gap:"0.5rem",flexWrap:"wrap",marginTop:"0.5rem",alignItems:"center"}}>
+          <TInput type="date" value={date} onChange={setDate} style={{width:145}}/>
+          <TInput type="number" value={dist} onChange={setDist} placeholder="Distance" style={{width:110}}/>
+          <Select value={unit} onChange={setUnit} style={{width:70}}><option value="mi">mi</option><option value="km">km</option></Select>
+          <TInput type="number" value={dur} onChange={setDur} placeholder="Duration (min)" style={{width:145}}/>
+          <Btn variant="primary" onClick={addLog}>+ Log Run</Btn>
+        </div>
+        {allLogs.length>0&&(
+          <div style={{marginTop:"1rem",display:"flex",flexDirection:"column",gap:"0.3rem",maxHeight:220,overflowY:"auto"}}>
+            <Label>Recent Runs</Label>
+            {[...allLogs].sort((a,b)=>b.date.localeCompare(a.date)).map(l=>(
+              <div key={l.id} style={{display:"flex",alignItems:"center",gap:"0.5rem",padding:"0.35rem 0.6rem",background:C.isDark?C.surface:C.dim,borderRadius:6}}>
+                <span style={{fontFamily:"system-ui",fontSize:"0.72rem",color:C.sub,minWidth:60}}>{fmtDate(l.date)}</span>
+                <span style={{fontFamily:"system-ui",fontSize:"0.8rem",fontWeight:700,color:C.teal}}>{l.distance} {l.unit}</span>
+                {l.duration&&<span style={{fontFamily:"system-ui",fontSize:"0.72rem",color:C.sub}}>{l.duration} min</span>}
+                {l.duration&&l.distance&&<span style={{fontFamily:"system-ui",fontSize:"0.7rem",color:C.purple}}>{pace(l.distance,l.duration)}</span>}
+                <button onClick={()=>setHealth(h=>({...h,cardioLogs:h.cardioLogs.filter(x=>x.id!==l.id)}))} style={{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:"0.85rem",marginLeft:"auto"}}>×</button>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+function SummarySection({ health }) {
+  const C = useTheme(), isMobile = useIsMobile();
+  const [range, setRange] = useState(30);
+  const weightLogs = useMemo(() => filterByRange(health.weightLog || [], range), [health.weightLog, range]);
+  const cardioLogs = useMemo(() => filterByRange(health.cardioLogs || [], range), [health.cardioLogs, range]);
+  const workoutLogs = useMemo(() => filterByRange(health.workoutLogs || [], range), [health.workoutLogs, range]);
+  const exercises = health.exercises || [];
+  const unit = health.weightUnit || "lbs";
+  const wSorted = [...weightLogs].sort((a,b)=>a.date.localeCompare(b.date));
+  const latestW = wSorted[wSorted.length-1];
+  const firstW = wSorted[0];
+  const weightChange = latestW&&firstW&&latestW.id!==firstW.id?(Number(latestW.weight)-Number(firstW.weight)).toFixed(1):null;
+  const weightChartData = wSorted.map(l=>({date:fmtDate(l.date),weight:Number(l.weight)}));
+  const totalDist = cardioLogs.reduce((s,l)=>s+Number(l.distance||0),0);
+  const totalRuns = cardioLogs.length;
+  const totalCardioMins = cardioLogs.reduce((s,l)=>s+Number(l.duration||0),0);
+  const paces = cardioLogs.filter(l=>l.duration&&l.distance).map(l=>l.duration/l.distance);
+  const avgPace = paces.length?paces.reduce((s,p)=>s+p,0)/paces.length:null;
+  const cardioChartData = [...cardioLogs].sort((a,b)=>a.date.localeCompare(b.date)).map(l=>({date:fmtDate(l.date),distance:Number(l.distance)}));
+  const totalSessions = workoutLogs.length;
+  const uniqueExDone = new Set(workoutLogs.map(l=>l.exerciseId)).size;
+  const totalVolume = workoutLogs.reduce((s,l)=>s+l.sets.reduce((ss,x)=>ss+(x.reps*(x.weight||0)),0),0);
+  const activityMap = {};
+  [...workoutLogs,...cardioLogs].forEach(l=>{activityMap[l.date]=(activityMap[l.date]||0)+1;});
+  weightLogs.forEach(l=>{activityMap[l.date]=(activityMap[l.date]||0)+0.5;});
+  const calDays = useMemo(()=>{const days=[];for(let i=range-1;i>=0;i--)days.push(subDays(today(),i));return days;},[range]);
+  const prData = exercises.map(ex=>{
+    const logs=workoutLogs.filter(l=>l.exerciseId===ex.id);
+    const allWeights=logs.flatMap(l=>l.sets.map(s=>s.weight||0));
+    const allReps=logs.flatMap(l=>l.sets.map(s=>s.reps||0));
+    return{...ex,pr:allWeights.length?Math.max(...allWeights):null,maxReps:allReps.length?Math.max(...allReps):null,sessions:logs.length};
+  }).filter(e=>e.sessions>0).sort((a,b)=>b.sessions-a.sessions);
+  const weekBuckets={};
+  calDays.forEach(d=>{const week=d.slice(0,7);if(!weekBuckets[week])weekBuckets[week]={week:d.slice(5,7)+"/"+d.slice(8),lifting:0,cardio:0};});
+  workoutLogs.forEach(l=>{const w=l.date.slice(0,7);if(weekBuckets[w])weekBuckets[w].lifting++;});
+  cardioLogs.forEach(l=>{const w=l.date.slice(0,7);if(weekBuckets[w])weekBuckets[w].cardio++;});
+  const activityBarData=Object.values(weekBuckets);
+  const CAT_COLORS_MAP={upper:C.blue,lower:C.green};
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:"1.2rem"}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:"0.5rem"}}>
+        <p style={{margin:0,fontFamily:"system-ui",fontSize:"0.78rem",color:C.sub}}>Showing data for the selected period</p>
+        <RangeToggle value={range} onChange={setRange}/>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr 1fr":"repeat(4,1fr)",gap:"0.75rem"}}>
+        <KPI label="Weight Change" value={weightChange?`${weightChange>0?"+":""}${weightChange} ${unit}`:"—"} sub={latestW?`Now: ${latestW.weight} ${unit}`:"no data"} color={weightChange&&Number(weightChange)<0?C.green:weightChange&&Number(weightChange)>0?C.red:C.sub}/>
+        <KPI label="Runs" value={totalRuns||"—"} sub={totalDist?`${totalDist.toFixed(1)} mi total`:"no runs"} color={C.teal}/>
+        <KPI label="Lift Sessions" value={totalSessions||"—"} sub={uniqueExDone?`${uniqueExDone} exercises`:"no sessions"} color={C.blue}/>
+        <KPI label="Total Volume" value={totalVolume?`${(totalVolume/1000).toFixed(1)}k lbs`:"—"} sub="weight × reps" color={C.purple}/>
+      </div>
+      <Card>
+        <Label>Activity Heatmap</Label>
+        <div style={{display:"flex",flexWrap:"wrap",gap:3,marginTop:"0.6rem"}}>
+          {calDays.map(d=>{const count=activityMap[d]||0,intensity=count===0?0:count<2?1:count<3?2:3,colors=[C.isDark?C.dim:C.border,C.teal+"55",C.teal+"99",C.teal];return(<div key={d} title={`${fmtDate(d)}${count?` — ${Math.floor(count)} activities`:""}`} style={{width:14,height:14,borderRadius:3,background:colors[intensity],cursor:"default",transition:"background 0.2s"}}/>);})}
+        </div>
+        <div style={{display:"flex",gap:"0.75rem",marginTop:"0.6rem",alignItems:"center"}}>
+          <span style={{fontFamily:"system-ui",fontSize:"0.6rem",color:C.muted}}>Less</span>
+          {[C.isDark?C.dim:C.border,C.teal+"55",C.teal+"99",C.teal].map((c,i)=><div key={i} style={{width:12,height:12,borderRadius:3,background:c}}/>)}
+          <span style={{fontFamily:"system-ui",fontSize:"0.6rem",color:C.muted}}>More</span>
+        </div>
+      </Card>
+      <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":"1fr 1fr",gap:"1rem"}}>
+        <Card>
+          <Label>⚖️ Weight Trend</Label>
+          {weightChartData.length<2?<div style={{padding:"1.5rem",textAlign:"center",color:C.muted,fontFamily:"system-ui",fontSize:"0.78rem"}}>Not enough weight data in this range.</div>
+          :<ResponsiveContainer width="100%" height={180}><AreaChart data={weightChartData} margin={{top:6,right:6,left:0,bottom:0}}><defs><linearGradient id="swGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={C.blue} stopOpacity={0.3}/><stop offset="95%" stopColor={C.blue} stopOpacity={0}/></linearGradient></defs><CartesianGrid strokeDasharray="3 3" stroke={C.border}/><XAxis dataKey="date" tick={{fill:C.sub,fontFamily:"system-ui",fontSize:9}} axisLine={false} tickLine={false}/><YAxis tick={{fill:C.sub,fontFamily:"system-ui",fontSize:9}} axisLine={false} tickLine={false} domain={["auto","auto"]}/><Tooltip content={<CustomTooltip/>}/><Area type="monotone" dataKey="weight" stroke={C.blue} strokeWidth={2.5} fill="url(#swGrad)" dot={false} name={`Weight (${unit})`}/></AreaChart></ResponsiveContainer>}
+        </Card>
+        <Card>
+          <Label>🏃 Cardio Distance</Label>
+          {cardioChartData.length<1?<div style={{padding:"1.5rem",textAlign:"center",color:C.muted,fontFamily:"system-ui",fontSize:"0.78rem"}}>No cardio logged in this range.</div>
+          :<ResponsiveContainer width="100%" height={180}><BarChart data={cardioChartData} margin={{top:6,right:6,left:0,bottom:0}}><CartesianGrid strokeDasharray="3 3" stroke={C.border}/><XAxis dataKey="date" tick={{fill:C.sub,fontFamily:"system-ui",fontSize:9}} axisLine={false} tickLine={false}/><YAxis tick={{fill:C.sub,fontFamily:"system-ui",fontSize:9}} axisLine={false} tickLine={false}/><Tooltip content={<CustomTooltip/>}/><Bar dataKey="distance" fill={C.teal} radius={[4,4,0,0]} name="Distance (mi)"/></BarChart></ResponsiveContainer>}
+        </Card>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":"2fr 1fr",gap:"1rem"}}>
+        <Card>
+          <Label>🏋️ Monthly Activity Breakdown</Label>
+          {activityBarData.length<1?<div style={{padding:"1.5rem",textAlign:"center",color:C.muted,fontFamily:"system-ui",fontSize:"0.78rem"}}>No activity in this range.</div>
+          :<ResponsiveContainer width="100%" height={180}><BarChart data={activityBarData} margin={{top:6,right:6,left:0,bottom:0}}><CartesianGrid strokeDasharray="3 3" stroke={C.border}/><XAxis dataKey="week" tick={{fill:C.sub,fontFamily:"system-ui",fontSize:9}} axisLine={false} tickLine={false}/><YAxis tick={{fill:C.sub,fontFamily:"system-ui",fontSize:9}} axisLine={false} tickLine={false} allowDecimals={false}/><Tooltip content={<CustomTooltip/>}/><Legend wrapperStyle={{fontFamily:"system-ui",fontSize:"0.68rem"}}/><Bar dataKey="lifting" fill={C.blue} radius={[3,3,0,0]} name="Lift Sessions" stackId="a"/><Bar dataKey="cardio" fill={C.teal} radius={[3,3,0,0]} name="Cardio Sessions" stackId="a"/></BarChart></ResponsiveContainer>}
+        </Card>
+        <Card style={{display:"flex",flexDirection:"column",gap:"0.75rem"}}>
+          <Label>🏃 Cardio Summary</Label>
+          {[{label:"Total Runs",value:totalRuns||"—",color:C.teal},{label:"Total Distance",value:totalDist?`${totalDist.toFixed(1)} mi`:"—",color:C.teal},{label:"Avg Pace",value:avgPace?pace(1,avgPace):"—",color:C.purple},{label:"Total Time",value:totalCardioMins?`${Math.floor(totalCardioMins/60)}h ${Math.round(totalCardioMins%60)}m`:"—",color:C.gold}].map(row=>(
+            <div key={row.label} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"0.35rem 0",borderBottom:`1px solid ${C.border}`}}>
+              <span style={{fontFamily:"system-ui",fontSize:"0.72rem",color:C.sub}}>{row.label}</span>
+              <span style={{fontFamily:"system-ui",fontSize:"0.82rem",fontWeight:700,color:row.color}}>{row.value}</span>
+            </div>
+          ))}
+        </Card>
+      </div>
+      {prData.length>0&&(
+        <Card>
+          <Label>🏆 Lift Summary — Active Exercises</Label>
+          <div style={{display:"flex",flexWrap:"wrap",gap:"0.6rem",marginTop:"0.6rem"}}>
+            {prData.map(ex=>{const col=CAT_COLORS_MAP[ex.category]||C.sub;return(
+              <div key={ex.id} style={{background:C.isDark?C.surface:C.dim,border:`1px solid ${col}44`,borderRadius:10,padding:"0.6rem 0.9rem",minWidth:140,flex:"1 1 140px"}}>
+                <div style={{display:"flex",alignItems:"center",gap:"5px",marginBottom:"0.3rem"}}><div style={{width:7,height:7,borderRadius:"50%",background:col,flexShrink:0}}/><span style={{fontFamily:"system-ui",fontSize:"0.75rem",fontWeight:700,color:C.text}}>{ex.name}</span></div>
+                <div style={{display:"flex",flexDirection:"column",gap:"0.2rem"}}>
+                  <div style={{display:"flex",justifyContent:"space-between"}}><span style={{fontFamily:"system-ui",fontSize:"0.62rem",color:C.muted}}>Sessions</span><span style={{fontFamily:"system-ui",fontSize:"0.68rem",fontWeight:600,color:C.text}}>{ex.sessions}</span></div>
+                  {!ex.isBodyweight&&ex.pr&&<div style={{display:"flex",justifyContent:"space-between"}}><span style={{fontFamily:"system-ui",fontSize:"0.62rem",color:C.muted}}>Top Weight</span><span style={{fontFamily:"system-ui",fontSize:"0.68rem",fontWeight:700,color:C.gold}}>🏆 {ex.pr} lbs</span></div>}
+                  {ex.maxReps&&<div style={{display:"flex",justifyContent:"space-between"}}><span style={{fontFamily:"system-ui",fontSize:"0.62rem",color:C.muted}}>Max Reps</span><span style={{fontFamily:"system-ui",fontSize:"0.68rem",fontWeight:600,color:col}}>{ex.maxReps}</span></div>}
+                </div>
+              </div>
+            );})}
+          </div>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+function HealthTracker({ health, setHealth }) {
+  const C = useTheme();
+  const [section, setSection] = useState("summary");
+  return (
+    <div>
+      <div style={{display:"flex",gap:"0.5rem",marginBottom:"1.25rem",alignItems:"center",flexWrap:"wrap"}}>
+        <button onClick={()=>setSection("summary")} style={{background:section==="summary"?C.gold:C.isDark?C.dim:"#f0f0f0",color:section==="summary"?"#fff":C.sub,border:`1px solid ${section==="summary"?C.gold:C.border}`,borderRadius:8,padding:"6px 16px",fontFamily:"system-ui",fontSize:"0.75rem",fontWeight:600,cursor:"pointer",whiteSpace:"nowrap"}}>📊 Summary</button>
+        <div style={{width:1,height:24,background:C.border}}/>
+        <div style={{display:"flex",background:C.isDark?C.dim:"#f0f0f0",border:`1px solid ${C.border}`,borderRadius:9,padding:3,gap:2}}>
+          {[{key:"weight",label:"⚖️ Weight"},{key:"lifting",label:"🏋️ Lifting"},{key:"cardio",label:"🏃 Cardio"}].map(s=>(
+            <button key={s.key} onClick={()=>setSection(s.key)} style={{background:section===s.key?C.isDark?"#444":"#fff":"transparent",color:section===s.key?C.text:C.sub,border:section===s.key?`1px solid ${C.border}`:"1px solid transparent",borderRadius:7,padding:"6px 14px",fontFamily:"system-ui",fontSize:"0.75rem",fontWeight:600,cursor:"pointer",whiteSpace:"nowrap"}}>{s.label}</button>
+          ))}
+        </div>
+      </div>
+      {section==="summary"&&<SummarySection health={health}/>}
+      {section==="weight"&&<WeightSection health={health} setHealth={setHealth}/>}
+      {section==="lifting"&&<LiftingSection health={health} setHealth={setHealth}/>}
+      {section==="cardio"&&<CardioSection health={health} setHealth={setHealth}/>}
+    </div>
+  );
+}
+
+// ── Root App ──────────────────────────────────────────────────────────────────
+export default function App() {
+  const [tab, setTab] = useState("budget");
+  const [budget, setBudget] = useState(null);
+  const [nw, setNw] = useState(null);
+  const [health, setHealth] = useState(null);
+  const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [isDark, setIsDark] = useState(true);
+  const [user, setUser] = useState(null);
+  const [token, setToken] = useState(null);
+  const isMobile = useIsMobile();
+  const C = isDark ? DARK : LIGHT;
+
+  // Check for existing session on mount
+  useEffect(() => {
+    (async () => {
+      const session = await sbGetSession();
+      if (session?.access_token && session?.user) {
+        setUser({ id: session.user.id, email: session.user.email });
+        setToken(session.access_token);
+      } else {
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  // Load data from cloud when user/token is set
+  useEffect(() => {
+    if (!user || !token) return;
+    (async () => {
+      setLoading(true);
+      const theme = loadLocal("theme-v1", { isDark: true });
+      setIsDark(theme.isDark);
+      const cloud = await loadFromCloud(user.id, token);
+      if (cloud) {
+        setBudget(cloud.budget || DEFAULT_BUDGET);
+        setNw(cloud.networth || DEFAULT_NETWORTH);
+        setHealth(cloud.health || DEFAULT_HEALTH);
+      } else {
+        setBudget(loadLocal("budget-v2", DEFAULT_BUDGET));
+        setNw(loadLocal("networth-v1", DEFAULT_NETWORTH));
+        setHealth(loadLocal("health-v1", DEFAULT_HEALTH));
+      }
+      setLoading(false);
+    })();
+  }, [user, token]);
+
+  const handleAuth = (authedUser, accessToken) => {
+    setUser(authedUser);
+    setToken(accessToken);
+  };
+
+  const handleSignOut = async () => {
+    if (token) await sbSignOut(token);
+    localStorage.removeItem("sb_session");
+    setUser(null); setToken(null);
+    setBudget(null); setNw(null); setHealth(null);
+  };
+
+  const handleSave = useCallback(async () => {
+    if (!user || !token) return;
+    setSaveError("");
+    saveLocal("theme-v1", { isDark });
+    const ok = await saveToCloud(user.id, token, budget, nw, health);
+    if (ok) {
+      saveLocal("budget-v2", budget);
+      saveLocal("networth-v1", nw);
+      saveLocal("health-v1", health);
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } else {
+      setSaveError("Save failed. Check your connection.");
+      setTimeout(() => setSaveError(""), 3000);
+    }
+  }, [budget, nw, health, isDark, user, token]);
+
+  if (!user) return <AuthScreen onAuth={handleAuth} />;
+
+  if (loading) return (
+    <div style={{ minHeight: "100vh", background: DARK.bg, display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: "0.75rem" }}>
+      <div style={{ width: 32, height: 32, border: `3px solid ${DARK.border}`, borderTopColor: DARK.gold, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+      <p style={{ color: DARK.sub, fontFamily: "system-ui", fontSize: "0.8rem" }}>Loading your data...</p>
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+    </div>
+  );
+
+  const tabs = [
+    { key: "budget", label: isMobile ? "💰" : "💰 Budget" },
+    { key: "networth", label: isMobile ? "📈" : "📈 Net Worth" },
+    { key: "health", label: isMobile ? "💪" : "💪 Health" },
+  ];
+
+  return (
+    <ThemeCtx.Provider value={C}>
+      <div style={{ minHeight: "100vh", background: C.bg, color: C.text, fontFamily: "system-ui,-apple-system,sans-serif", transition: "background 0.2s,color 0.2s" }}>
+        <div style={{ background: C.surface, borderBottom: `1px solid ${C.border}`, padding: isMobile ? "0.7rem 1rem" : "0.8rem 1.5rem", display: "flex", alignItems: "center", justifyContent: "space-between", position: "sticky", top: 0, zIndex: 100, boxShadow: C.isDark ? "0 1px 0 rgba(255,255,255,0.05)" : "0 1px 4px rgba(0,0,0,0.08)", gap: "0.6rem", flexWrap: isMobile ? "wrap" : "nowrap" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "0.6rem" }}>
+            <div style={{ width: 28, height: 28, borderRadius: 8, background: C.isDark ? "#333" : "#e8e8e8", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "0.85rem" }}>💼</div>
+            <h1 style={{ margin: 0, fontSize: isMobile ? "1rem" : "1.1rem", fontWeight: 700, letterSpacing: "-0.02em" }}>Life <span style={{ color: C.gold }}>Tracker</span></h1>
+          </div>
+          <div style={{ display: "flex", gap: "0.45rem", alignItems: "center", marginLeft: "auto" }}>
+            <div style={{ display: "flex", gap: "0.2rem", background: C.isDark ? C.dim : "#f0f0f0", padding: "3px", borderRadius: 8, border: `1px solid ${C.border}` }}>
+              {tabs.map(t => (
+                <button key={t.key} onClick={() => setTab(t.key)} style={{ background: tab === t.key ? C.isDark ? "#444" : "#fff" : "transparent", color: tab === t.key ? C.text : C.sub, border: tab === t.key ? `1px solid ${C.border}` : "1px solid transparent", borderRadius: 6, padding: isMobile ? "5px 10px" : "5px 13px", fontFamily: "system-ui", fontSize: "0.73rem", fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>{t.label}</button>
+              ))}
+            </div>
+            <button onClick={() => setIsDark(d => !d)} style={{ background: C.isDark ? C.dim : "#f0f0f0", border: `1px solid ${C.border}`, borderRadius: 8, padding: isMobile ? "6px 8px" : "6px 11px", cursor: "pointer", color: C.text, fontSize: "0.85rem", display: "flex", alignItems: "center", gap: "4px" }}>
+              {isDark ? "☀️" : "🌙"}{!isMobile && <span style={{ fontSize: "0.67rem", color: C.sub, fontFamily: "system-ui" }}>{isDark ? "Light" : "Dark"}</span>}
+            </button>
+            {!isMobile && <span style={{ fontFamily: "system-ui", fontSize: "0.65rem", color: C.muted, maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{user.email}</span>}
+            <button onClick={handleSave} style={{ background: saveError ? C.red : saved ? C.green : C.isDark ? "#ffffff" : "#1a1a1a", color: saved || saveError ? "#fff" : C.isDark ? "#1a1a1a" : "#ffffff", border: "none", borderRadius: 8, padding: isMobile ? "6px 10px" : "6px 15px", fontFamily: "system-ui", fontSize: "0.73rem", fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>
+              {saveError ? "⚠️ Error" : saved ? "✓ Saved!" : isMobile ? "💾" : "☁️ Save"}
+            </button>
+            <button onClick={handleSignOut} style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 8, padding: isMobile ? "6px 8px" : "6px 11px", cursor: "pointer", color: C.sub, fontFamily: "system-ui", fontSize: "0.7rem", fontWeight: 600, whiteSpace: "nowrap" }}>
+              {isMobile ? "↩" : "Sign Out"}
+            </button>
+          </div>
+        </div>
+        <div style={{ padding: isMobile ? "1rem" : "1.5rem 2rem", maxWidth: 1150, margin: "0 auto" }}>
+          {tab === "budget" && <BudgetEditor budget={budget} setBudget={setBudget} />}
+          {tab === "networth" && <NetWorthEditor nw={nw} setNw={setNw} />}
+          {tab === "health" && <HealthTracker health={health} setHealth={setHealth} />}
+        </div>
+      </div>
+    </ThemeCtx.Provider>
+  );
+}
+
+
+const container = document.getElementById('root');
+const root = ReactDOM.createRoot(container);
+root.render(React.createElement(App));
+</script>
+</body>
+</html>
